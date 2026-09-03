@@ -6,3 +6,5 @@ log/
 *.sqlite
 *.bag
 *.bag.active
+.pio/
+.DS_Store
