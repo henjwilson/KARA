@@ -1,0 +1,1211 @@
+"""Program editor component with script execution and command palette."""
+
+import asyncio
+import logging
+import re
+from typing import Any, Callable
+
+import waldoctl
+from nicegui import Client, context, ui
+from waldoctl import EditId, Program, ProgramTarget
+
+from waldo_commander.common.theme import get_theme
+from waldo_commander.constants import default_program_dir
+from waldo_commander.services.programs import (
+    active_cursor_line,
+    advance_active_cursor,
+    insert_below_line,
+    is_any_program_recording,
+    is_any_program_running,
+)
+from waldo_commander.services import edit_decisions
+from waldo_commander.services.control_lease import control_mode
+from waldo_commander.services.motion_recorder import motion_recorder, move_snippet
+from waldo_commander.state import (
+    simulation_state,
+    ui_state,
+)
+from waldo_commander.services.command_discovery import (
+    discover_robot_commands,
+    generate_completions_from_commands,
+)
+from waldo_commander.components.editor_decorations import decorations
+from waldo_commander.components.log_panel import (
+    LOG_COLLAPSED_VALUE,
+    LOG_MAX_LINES,
+    log_panel,
+)
+from waldo_commander.components.simulation_engine import (
+    default_python_snippet,
+    get_home_joints_rad,
+    is_default_script,
+    simulation,
+)
+from waldo_commander.components.script_execution import script_exec
+from waldo_commander.components.playback import playback
+from waldo_commander.components.file_operations import FileOperationsMixin
+
+logger = logging.getLogger(__name__)
+
+
+class EditorPanel(FileOperationsMixin):
+    """Program editor panel with script execution and command palette."""
+
+    def __init__(self) -> None:
+        """Initialize editor panel with state and UI references."""
+        self.PROGRAM_DIR = default_program_dir()
+        script_exec.set_program_dir(self.PROGRAM_DIR)
+
+        self.tabs_container: ui.tabs | None = None
+        self.tab_panels_container: ui.tab_panels | None = None
+        # Pending-edit review cluster in the header row: while the active tab
+        # has a proposed edit awaiting review it swaps in for the toolbar
+        # buttons (which would mutate the source under the diff).
+        self._edit_review_row: ui.row | None = None
+        self._toolbar_btns: list[ui.button] = []
+        # (from_line, to_line) of a ranged editor selection, None for a bare cursor.
+        self._cursor_selection: tuple[int, int] | None = None
+        # tab_id -> {tab_element, filename_input, dirty_dot, panel, textarea}
+        self._tab_widgets: dict[str, dict] = {}
+        # tab_id -> pending edit-id .values already seen, so a *newly* proposed
+        # edit flashes once (like a motion-recorder insert) without re-flashing
+        # on the approve/reject that only shrinks the pending list.
+        self._seen_edit_ids: dict[str, set[str]] = {}
+        # Tabs whose CodeMirror currently has keyboard focus. CodeMirror echoes
+        # selection-change on every document change — including programmatic
+        # inserts — reporting a caret the user never placed; cursor tracking
+        # only follows events sent while the editor is focused.
+        self._focused_tab_ids: set[str] = set()
+
+        # The page client whose tab widgets this panel renders into. Captured at
+        # build() and used by _reconcile_tabs to enter the right context when a
+        # program mutation arrives from outside a page action (e.g. an MCP tool).
+        self._client: Client | None = None
+
+        # Active tab's widgets live on ui_state.active_textarea /
+        # active_filename_input — sub-controllers (decorations, simulation,
+        # motion recorder, script execution) read them from there directly.
+
+        # Playback singleton (owns bottom bar UI, playback logic, and recording).
+        # Kept as an instance attribute so external callers (and tests) can
+        # still read editor.playback.X.
+        self.playback = playback
+
+        # Debounce for tab-switch path rendering
+        self._tab_switch_render_task: asyncio.Task | None = None
+
+    def _insert_command(self, method_name: str) -> None:
+        """Build a snippet for ``method_name`` (pre-filled with the robot's
+        current position for move_j / move_l) and insert it below the cursor
+        line of the active textarea (at EOF when the cursor is unset)."""
+        textarea = ui_state.active_textarea
+        if not textarea:
+            return
+
+        utility_snippets = {
+            "delay": "time.sleep(1.0)",
+            "comment": "# Add your robot commands here",
+        }
+        if method_name in utility_snippets:
+            snippet = utility_snippets[method_name]
+        elif method_name == "move_j":
+            speed = max(0.01, min(1.0, waldoctl.commander.settings.jog.speed / 100.0))
+            accel = max(0.01, min(1.0, waldoctl.commander.settings.jog.accel / 100.0))
+            angles = list(waldoctl.commander.status.joints.angles.deg)
+            snippet = move_snippet("move_j", angles, speed=speed, accel=accel)
+        elif method_name == "move_l":
+            speed = max(0.01, min(1.0, waldoctl.commander.settings.jog.speed / 100.0))
+            accel = max(0.01, min(1.0, waldoctl.commander.settings.jog.accel / 100.0))
+            pose = [
+                waldoctl.commander.status.pose.x,
+                waldoctl.commander.status.pose.y,
+                waldoctl.commander.status.pose.z,
+                waldoctl.commander.status.pose.rx,
+                waldoctl.commander.status.pose.ry,
+                waldoctl.commander.status.pose.rz,
+            ]
+            snippet = move_snippet("move_l", pose, speed=speed, accel=accel)
+        else:
+            all_commands = discover_robot_commands()
+            snippet = all_commands.get(method_name, {}).get(
+                "snippet", f"rbt.{method_name}(...)"
+            )
+
+        new_value, first_line, count = insert_below_line(
+            textarea.value or "", snippet, active_cursor_line()
+        )
+        textarea.value = new_value
+        advance_active_cursor(first_line + count - 1)
+        logger.info("Added Python snippet at line %d: %s", first_line, snippet)
+
+    def sync_code_from_target(
+        self,
+        target_id: str,
+        pose: list[float],
+        *,
+        move_type: str | None = None,
+        joint_angles_deg: list[float] | None = None,
+    ) -> None:
+        """Update the program code with the new pose for a specific target.
+
+        Uses CM6 StateField position tracking to find the target line.
+        Positions are tracked through edits, so this works even after
+        the user inserts/deletes lines.
+
+        Note: pose is in scene units (meters for position, degrees for rotation).
+        Code uses user units (mm for position, degrees for rotation).
+
+        If move_type is provided (e.g. "joints"), the move command is also
+        converted (move_l→move_j or vice versa). joint_angles_deg must be
+        provided when converting to move_j.
+        """
+        textarea = ui_state.active_textarea
+        if not textarea:
+            return
+
+        try:
+            current_value = textarea.value
+            if current_value is None:
+                logger.debug("Sync skipped: codemirror value is None")
+                return
+        except (AttributeError, RuntimeError) as e:
+            logger.debug("Sync skipped: codemirror not ready - %s", e)
+            return
+
+        line_number = textarea.line_anchors.get(target_id)
+        if line_number is None:
+            logger.warning("Sync failed: Target %s not found", target_id)
+            return
+
+        content = current_value
+        lines = content.splitlines()
+        found_line_idx = line_number - 1
+
+        if found_line_idx < 0 or found_line_idx >= len(lines):
+            logger.warning("Sync failed: Line %d out of range", line_number)
+            return
+
+        line = lines[found_line_idx]
+
+        # Match the coordinate list (a bracketed list of numbers) in the line.
+        match = re.search(r"(\[[\d\.\,\-\s]+\])", line)
+
+        if match:
+            if move_type == "joints" and joint_angles_deg is not None:
+                new_values_str = (
+                    "[" + ", ".join(f"{v:.3f}" for v in joint_angles_deg) + "]"
+                )
+                new_line = line[: match.start()] + new_values_str + line[match.end() :]
+                new_line = new_line.replace("rbt.move_l(", "rbt.move_j(")
+                new_line = new_line.replace("rbt.move_c(", "rbt.move_j(")
+            else:
+                # Convert from scene units (meters) to user units (mm) for position
+                pose_mm = [
+                    pose[0] * 1000.0 if len(pose) > 0 else 0.0,
+                    pose[1] * 1000.0 if len(pose) > 1 else 0.0,
+                    pose[2] * 1000.0 if len(pose) > 2 else 0.0,
+                    pose[3] if len(pose) > 3 else 0.0,
+                    pose[4] if len(pose) > 4 else 0.0,
+                    pose[5] if len(pose) > 5 else 0.0,
+                ]
+                new_values_str = "[" + ", ".join(f"{v:.3f}" for v in pose_mm) + "]"
+                new_line = line[: match.start()] + new_values_str + line[match.end() :]
+
+            lines[found_line_idx] = new_line
+            textarea.value = "\n".join(lines)
+            logger.info(
+                "Synced code for target %s at line %d: %s",
+                target_id,
+                line_number,
+                new_values_str,
+            )
+        else:
+            logger.warning(
+                "Sync failed: Could not find coordinate list in line: %s", line
+            )
+
+    # Single-pose targets only: multi-pose lines (move_c via+end) can't be
+    # re-taught from one pose — sync would overwrite just the first bracket.
+    _RETEACHABLE_MOVE_TYPES = ("joints", "cartesian", "pose")
+    # sync_code_from_target rewrites only the bracketed list and keeps every
+    # kwarg — absolute current-position values under rel=/frame=/pose=
+    # semantics would corrupt the move (e.g. a 250mm relative lunge).
+    _RETEACH_KWARG_RE = re.compile(r"\b(?:rel|frame|pose)\s*=")
+    _CAPTURE_TIP_INSERT = "Capture pose: insert a move at the current robot position"
+    _CAPTURE_TIP_RETEACH = "Capture pose: re-teach this step in place"
+    _CAPTURE_TIP_BLOCKED = (
+        "Capture pose: this step uses rel=, frame=, or pose= — inserts instead"
+    )
+    _CAPTURE_TIP_REPLACE = "Capture pose: replace the selected lines with one move"
+
+    def _reteach_state(self) -> tuple[ProgramTarget | None, bool]:
+        """(target, blocked) for the cursor line; blocked means a target sits
+        there but its kwargs make a bracket rewrite unsafe.
+
+        The target's live line anchor must still sit on the cursor line:
+        after an edit, targets keep sim-time line numbers until the debounced
+        re-sim, while sync_code_from_target writes at the tracked anchor —
+        without this check a click could rewrite a line the cursor isn't on.
+        """
+        tab = waldoctl.commander.programs.active
+        textarea = ui_state.active_textarea
+        if tab is None or textarea is None:
+            return None, False
+        line = tab.dry_run.playback.active_cursor_line
+        if line <= 0:
+            return None, False
+        anchors = textarea.line_anchors
+        for t in tab.dry_run.targets:
+            if (
+                t.line_number == line
+                and t.move_type in self._RETEACHABLE_MOVE_TYPES
+                and anchors.get(t.id) == line
+            ):
+                lines = str(textarea.value or "").split("\n")
+                text = lines[line - 1] if line <= len(lines) else ""
+                if self._RETEACH_KWARG_RE.search(text):
+                    return None, True
+                return t, False
+        return None, False
+
+    def _target_at_cursor(self) -> ProgramTarget | None:
+        """Re-teachable dry-run target whose line the editor cursor is on."""
+        return self._reteach_state()[0]
+
+    def capture_pose_at_cursor(self) -> None:
+        """Stamp the robot's current position into the program at the cursor.
+
+        A ranged selection is replaced wholesale by one move line; a bare
+        cursor on a re-teachable move rewrites that step in place (kwargs
+        kept); anywhere else the move is inserted as a new line.
+        """
+        span = self._cursor_selection
+        if span is not None:
+            self._replace_lines_with_pose(*span)
+            return
+        if self._target_at_cursor() is not None:
+            self._reteach_at_cursor()
+            return
+        motion_recorder.capture_current_pose()
+
+    def _replace_lines_with_pose(self, from_line: int, to_line: int) -> None:
+        textarea = ui_state.active_textarea
+        if textarea is None:
+            return
+        lines = str(textarea.value or "").split("\n")
+        if not 1 <= from_line <= to_line <= len(lines):
+            return
+        lines[from_line - 1 : to_line] = [motion_recorder.current_pose_snippet()]
+        textarea.set_value("\n".join(lines))
+
+    def _update_capture_button(self) -> None:
+        tip = ui_state.capture_pose_tooltip
+        if tip is None or tip.is_deleted:
+            return
+        if self._cursor_selection is not None:
+            tip.set_text(self._CAPTURE_TIP_REPLACE)
+            return
+        target, blocked = self._reteach_state()
+        if target is not None:
+            tip.set_text(self._CAPTURE_TIP_RETEACH)
+        elif blocked:
+            tip.set_text(self._CAPTURE_TIP_BLOCKED)
+        else:
+            tip.set_text(self._CAPTURE_TIP_INSERT)
+
+    def _reteach_at_cursor(self) -> None:
+        """Overwrite the move at the cursor with the robot's current position.
+
+        move_j lines get the current joint angles; move_l lines get the
+        current WRF pose — passing a pose against a joint-angle list (or vice
+        versa) would corrupt the line.
+        """
+        target = self._target_at_cursor()
+        if target is None:
+            return
+        n = ui_state.active_robot.joints.count
+        angles = list(waldoctl.commander.status.joints.angles.deg[:n])
+        if len(angles) < n:
+            # No status frames yet — overwriting would replace the taught
+            # values with zeros (pose) or a truncated list (joints).
+            return
+        if target.move_type == "joints":
+            self.sync_code_from_target(
+                target.id, target.pose, move_type="joints", joint_angles_deg=angles
+            )
+        else:
+            pose = waldoctl.commander.status.pose
+            # sync_code_from_target expects scene units (m); status pose is mm.
+            self.sync_code_from_target(
+                target.id,
+                [
+                    pose.x / 1000.0,
+                    pose.y / 1000.0,
+                    pose.z / 1000.0,
+                    pose.rx,
+                    pose.ry,
+                    pose.rz,
+                ],
+            )
+
+    def delete_target_code(self, target_id: str) -> None:
+        """Delete the code line corresponding to the target and re-simulate.
+
+        Uses CM6 StateField position tracking to find the line.
+        """
+        textarea = ui_state.active_textarea
+        if not textarea:
+            return
+
+        line_number = textarea.line_anchors.get(target_id)
+        if line_number is None:
+            logger.warning("Target %s not found for deletion", target_id)
+            return
+
+        content = textarea.value or ""
+        lines = content.splitlines()
+        line_idx = line_number - 1
+
+        if 0 <= line_idx < len(lines):
+            del lines[line_idx]
+            textarea.value = "\n".join(lines)
+            logger.info("Deleted target %s from code (line %d)", target_id, line_number)
+            # Re-simulation will trigger automatically via debounced on_change
+        else:
+            logger.warning("Target %s line %d out of range", target_id, line_number)
+
+    def add_target_code(self, pose: list[float], move_type: str) -> int | None:
+        """Add a move command to the editor.
+
+        Generates clean code without any internal markers.
+        The CM6 StateField will track the line position after the
+        next simulation run produces targets.
+
+        Args:
+            pose: [x, y, z, rx, ry, rz] position and orientation
+            move_type: Type of movement ("pose", "cartesian", "joints")
+
+        Returns:
+            1-indexed line number of the new line, or None on failure.
+        """
+        textarea = ui_state.active_textarea
+        if not textarea:
+            return None
+
+        speed = max(0.01, min(1.0, waldoctl.commander.settings.jog.speed / 100.0))
+        accel = max(0.01, min(1.0, waldoctl.commander.settings.jog.accel / 100.0))
+
+        method = "move_j" if move_type == "joints" else "move_l"
+        code_line = move_snippet(method, pose, speed=speed, accel=accel)
+
+        new_content, new_line_number, count = insert_below_line(
+            textarea.value or "", code_line, active_cursor_line()
+        )
+        # Assigning triggers a debounced simulation run.
+        textarea.value = new_content
+
+        advance_active_cursor(new_line_number + count - 1)
+        decorations.flash_editor_lines([new_line_number])
+
+        logger.info("Added target code at line %d: %s", new_line_number, code_line)
+        return new_line_number
+
+    def add_joint_target_code(self, joint_angles: list[float]) -> int | None:
+        """Add joint target code to the editor.
+
+        Args:
+            joint_angles: [j1, j2, j3, j4, j5, j6] joint angles in degrees
+
+        Returns:
+            1-indexed line number of the new line, or None on failure.
+        """
+        return self.add_target_code(joint_angles, move_type="joints")
+
+    def _build_command_menu(self) -> None:
+        """Build command palette as a dropdown menu with nested submenus."""
+        all_commands = discover_robot_commands()
+
+        categories: dict[str, list[dict[str, Any]]] = {}
+        for key, cmd in all_commands.items():
+            cat = cmd["category"]
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append({"key": key, **cmd})
+
+        with ui.menu():
+            for category_name, commands in sorted(categories.items()):
+                # auto_close must stay off so the submenu stays open while navigating.
+                with ui.menu_item(category_name, auto_close=False).classes(
+                    "text-sm font-medium"
+                ):
+                    with ui.item_section().props("side"):
+                        ui.icon("keyboard_arrow_right")
+                    with (
+                        ui.menu()
+                        .props('anchor="top end" self="top start" auto-close')
+                        .classes("max-h-80 overflow-y-auto")
+                    ):
+                        for cmd in sorted(commands, key=lambda c: c["title"]):
+                            item = ui.menu_item(
+                                cmd["title"],
+                                on_click=lambda e, k=cmd["key"]: self._insert_command(
+                                    k
+                                ),
+                            ).classes("text-sm")
+
+                            with item:
+                                tooltip_text = f"{cmd['signature']}"
+                                if cmd["docstring"]:
+                                    tooltip_text += f"\n\n{cmd['docstring']}"
+                                ui.tooltip(tooltip_text).classes("text-xs").style(
+                                    "max-width: 300px; white-space: pre-wrap;"
+                                )
+
+    def cleanup(self) -> None:
+        """Per-page cleanup — remove listeners and cancel timers registered
+        during ``build()``. Idempotent: safe to call from both
+        ``_on_disconnect`` and ``_on_shutdown``."""
+        waldoctl.commander.programs.remove_change_listener(self._reconcile_tabs)
+        simulation_state.remove_change_listener(self._update_capture_button)
+        ui_state.capture_pose_tooltip = None
+        self._cursor_selection = None
+        # Edit listeners live on the process-global tab.edits notifier; drop
+        # them so closures don't accumulate across page (re)builds.
+        for tab_id in list(self._tab_widgets):
+            self._unsubscribe_from_edits(tab_id)
+        if self._tab_switch_render_task is not None:
+            self._tab_switch_render_task.cancel()
+            self._tab_switch_render_task = None
+        self.playback.cleanup()
+        decorations.cleanup()
+        log_panel.cleanup()
+        simulation.cleanup()
+        script_exec.cleanup()
+
+    def _new_tab(
+        self, filename: str = "untitled.py", content: str | None = None
+    ) -> Program:
+        """Create a new tab and switch to it.
+
+        The tab's widgets are built by ``_reconcile_tabs`` (the change listener
+        on ``commander.programs``) when ``new()`` fires — the same path that
+        renders a program opened from an MCP tool.
+        """
+        source = content if content is not None else default_python_snippet()
+        tab = waldoctl.commander.programs.new(source=source, filename=filename)
+        self._switch_to_tab(tab.id)
+
+        if is_default_script(tab.source):
+            # Default script ends at home position - skip simulation;
+            # other dry-run fields default to [] so no further reset needed.
+            tab.dry_run.final_joints_rad = list(get_home_joints_rad())
+        elif tab.source.strip():
+            simulation.schedule_debounced_simulation(tab_id=tab.id)
+
+        return tab
+
+    def _close_tab(self, tab: Program) -> None:
+        """Close a tab, prompting to save if dirty.
+
+        Uses deferred execution via ui.timer to avoid modifying UI
+        during NiceGUI's event listener iteration.
+        """
+        # The subprocess outlives the page (script_exec.cleanup doesn't kill
+        # script_handle), so closing its launching tab would orphan the output:
+        # _record_line silently drops every line once programs.get returns None.
+        if is_any_program_running() and script_exec.is_launching_tab(tab.id):
+            ui.notify(
+                "Cannot close the tab whose script is running. Stop the script first.",
+                color="warning",
+            )
+            return
+
+        def do_close():
+            if tab.is_dirty:
+                self._show_save_confirmation(tab)
+            else:
+                self._do_close_tab(tab)
+
+        # Defer to avoid "dictionary changed size during iteration" in tests
+        ui.timer(0, do_close, once=True)
+
+    def _show_save_confirmation(self, tab: Program) -> None:
+        """Show save confirmation dialog for dirty tab."""
+        dlg = ui.dialog().classes("save-dialog")
+
+        def dont_save():
+            dlg.close()
+            self._do_close_tab(tab)
+
+        with dlg, ui.card().classes("overlay-card w-80"):
+            ui.label(f"Save changes to {tab.filename}?").classes(
+                "text-lg font-medium mb-2"
+            )
+            ui.label("Your changes will be lost if you don't save.").classes(
+                "text-sm text-gray-500 mb-4"
+            )
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button(
+                    "Don't Save",
+                    on_click=dont_save,
+                ).props("flat color=negative")
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                ui.button(
+                    "Save", on_click=lambda: self._save_tab_and_close(tab, dlg)
+                ).props("color=primary")
+        dlg.open()
+
+    def _do_close_tab(self, tab: Program) -> None:
+        """Actually close the tab and clean up UI."""
+        tab_id = tab.id
+
+        # Determine which tab to switch to BEFORE removing
+        tabs = waldoctl.commander.programs.items
+        closed_idx = next((i for i, t in enumerate(tabs) if t.id == tab_id), -1)
+        new_active_id = None
+
+        if len(tabs) > 1:
+            if closed_idx > 0:
+                new_active_id = tabs[closed_idx - 1].id
+            else:
+                new_active_id = tabs[
+                    1
+                ].id  # closing the first tab: fall to its successor
+
+        self._remove_tab_widgets(tab_id)
+        waldoctl.commander.programs.close(tab_id)
+
+        if not waldoctl.commander.programs.items:
+            self._new_tab()
+        elif new_active_id:
+            waldoctl.commander.programs.active_id = new_active_id
+            self._switch_to_tab(new_active_id)
+
+    def _remove_tab_widgets(self, tab_id: str) -> None:
+        """Delete a tab's DOM elements and drop its references. Idempotent —
+        the shared teardown for both the GUI close path and ``_reconcile_tabs``
+        (a program closed via an MCP tool)."""
+        # Drop the LLM-edit listener first, while its reference is still on the
+        # widget dict, so it can't fire against half-deleted elements.
+        self._unsubscribe_from_edits(tab_id)
+        widgets = self._tab_widgets.pop(tab_id, None)
+        if widgets:
+            if widgets.get("tab_element"):
+                widgets["tab_element"].delete()
+            if widgets.get("panel"):
+                widgets["panel"].delete()
+        ui_state.textareas_by_tab.pop(tab_id, None)
+        self._seen_edit_ids.pop(tab_id, None)
+        self._focused_tab_ids.discard(tab_id)
+
+    def _switch_blocked(self) -> bool:
+        """True (and notifies) when recording or active script playback should
+        block a tab switch or file open. Shared with file_operations.load_program
+        so the open() path is guarded before it mutates active_id."""
+        if is_any_program_recording():
+            ui.notify("Cannot switch tabs while recording", color="warning")
+            return True
+        # The running script's play state lives on the launching program, which
+        # may differ from the active tab (switching is allowed while paused), so
+        # resolve the lock against launching_tab_id like playback.toggle_play.
+        lock_prog = (
+            waldoctl.commander.programs.get(script_exec.launching_tab_id)
+            if script_exec.launching_tab_id
+            else waldoctl.commander.programs.active
+        )
+        if is_any_program_running() and (
+            lock_prog is not None and lock_prog.dry_run.playback.is_playing
+        ):
+            ui.notify("Cannot switch tabs during script playback", color="warning")
+            return True
+        return False
+
+    def _switch_to_tab(self, tab_id: str) -> None:
+        """Switch to a specific tab (blocked during recording/playback)."""
+        if self._switch_blocked():
+            # Reset UI to the active tab since the click already moved it visually.
+            if self.tabs_container and waldoctl.commander.programs.active_id:
+                self.tabs_container.set_value(waldoctl.commander.programs.active_id)
+            return
+
+        self.playback.stop_playback()
+        self.playback.invalidate_timeline()
+
+        tab = waldoctl.commander.programs.get(tab_id)
+        if not tab:
+            return
+
+        # Update active tab via the ProgramTabs verb (guards membership +
+        # fires notify_changed). Dry-run results, recording state, and step-
+        # lifecycle fields live on each Program directly — readers pull from
+        # ``commander.programs.active.dry_run.*``, so no copy/mirror step is
+        # needed on tab switch beyond resetting playback's per-tab scratch.
+        waldoctl.commander.programs.switch(tab_id)
+        tab.dry_run.playback.active_cursor_line = 0
+        self._update_capture_button()
+
+        if self.tab_panels_container:
+            self.tab_panels_container.set_value(tab_id)
+
+        if self.tabs_container:
+            self.tabs_container.set_value(tab_id)
+
+        # Reset the playback scrub state and schedule the deferred render
+        # against the freshly-active program.
+        self._invalidate_for_tab_switch()
+
+        # Swap log content: load new tab's log entries into shared log. Only the
+        # displayable tail is replayed — Program.log is unbounded, the widget
+        # keeps LOG_MAX_LINES, so pushing the whole history would serialize tens
+        # of thousands of lines just to show the last LOG_MAX_LINES.
+        log_panel.clear()
+        for entry in tab.log.entries[-LOG_MAX_LINES:]:
+            log_panel.push(entry.text)
+
+        widgets = self._tab_widgets.get(tab_id, {})
+        ui_state.active_textarea = widgets.get("textarea")
+        ui_state.active_filename_input = widgets.get("filename_input")
+        self._refresh_edits_banner(tab_id)
+
+    def _invalidate_for_tab_switch(self) -> None:
+        """Defer expensive path re-rendering after a tab switch.
+
+        Dry-run results live on each Program, so switching the active tab
+        already exposes the new program's data to every reader. This method
+        just resets the playback scrub state, invalidates the path-rendering
+        diff so the URDF scene re-paints from the new active program, and
+        fires the change channel so listeners refresh.
+        """
+        if self._tab_switch_render_task is not None:
+            self._tab_switch_render_task.cancel()
+
+        active = waldoctl.commander.programs.active
+        if active is not None:
+            active.dry_run.playback.current_step = 0
+
+        # Capture client context before creating task (asyncio.create_task
+        # doesn't propagate NiceGUI context)
+        try:
+            client = context.client
+        except RuntimeError:
+            client = None
+
+        async def _apply():
+            try:
+                await asyncio.sleep(0)  # yield so UI updates first
+                if ui_state.urdf_scene:
+                    ui_state.urdf_scene.invalidate_paths()
+                if client is not None:
+                    with client:
+                        self.playback.update_scrub_segments()
+                simulation_state.notify_changed()
+            finally:
+                if self._tab_switch_render_task is task:
+                    self._tab_switch_render_task = None
+
+        task = asyncio.create_task(_apply())
+        self._tab_switch_render_task = task
+
+    def _create_tab_widget(self, tab: Program) -> ui.tab | None:
+        """Create a single tab widget with filename input, save button, close button."""
+        if not self.tabs_container:
+            return None
+        existing = self._tab_widgets.get(tab.id)
+        if existing and "tab_element" in existing:
+            return existing["tab_element"]
+
+        with self.tabs_container:
+            tab_element = ui.tab(name=tab.id, label="").classes("editor-tab")
+            tab_element.mark(f"editor-tab-{tab.id}")
+            with tab_element:
+                with ui.row().classes("items-center gap-1 no-wrap"):
+                    # Dirty indicator (orange dot).
+                    dirty_dot = (
+                        ui.icon("fiber_manual_record", size="xs")
+                        .classes("text-amber-500")
+                        .style("font-size: 8px;")
+                    )
+                    dirty_dot.bind_visibility_from(tab, "is_dirty", lambda d: d)
+
+                    filename_input = (
+                        ui.input(value=tab.filename)
+                        .props("dense borderless")
+                        .classes("text-sm w-28")
+                        .on("change", lambda e, t=tab: setattr(t, "filename", e.args))
+                    )
+                    filename_input.mark(f"editor-tab-filename-{tab.id}")
+
+                    close_btn = (
+                        ui.button(
+                            icon="close", on_click=lambda _e, t=tab: self._close_tab(t)
+                        )
+                        .props("flat round dense size=xs")
+                        .classes("text-white")
+                        .tooltip("Close tab")
+                    )
+                    close_btn.mark(f"editor-tab-close-{tab.id}")
+
+            if tab.id not in self._tab_widgets:
+                self._tab_widgets[tab.id] = {}
+            self._tab_widgets[tab.id]["tab_element"] = tab_element
+            self._tab_widgets[tab.id]["filename_input"] = filename_input
+            self._tab_widgets[tab.id]["dirty_dot"] = dirty_dot
+
+        return tab_element
+
+    def _create_tab_panel(self, tab: Program) -> ui.tab_panel | None:
+        """Create content panel for a tab (CodeMirror only, log is shared)."""
+        if not self.tab_panels_container:
+            return None
+        existing = self._tab_widgets.get(tab.id)
+        if existing and "panel" in existing:
+            return existing["panel"]
+
+        with self.tab_panels_container:
+            panel = (
+                ui.tab_panel(name=tab.id)
+                .classes("editor-tab-panel")
+                .style("padding: 0; width: 100%; height: 100%; gap: 0;")
+            )
+            with panel:
+                completions = generate_completions_from_commands()
+
+                # Flex-fills the panel and uses CodeMirror's own internal
+                # scrolling; min-h-0 lets it shrink within the fixed height.
+                textarea = ui.codemirror(
+                    value=tab.source,
+                    language="Python",
+                    line_wrapping=True,
+                    on_change=lambda e, t=tab: self._on_tab_content_change(t, e.value),
+                    on_selection_change=lambda e, t=tab: self._on_cursor_line(t, e),
+                    on_focus_change=lambda e, t=tab: self._on_editor_focus(t, e),
+                    completions=completions,
+                    keymap={
+                        "Mod-s": lambda _e, t=tab: self._save_tab(t),
+                    },
+                    line_tooltip_html=True,
+                ).classes("w-full flex-1 min-h-0")
+
+                try:
+                    mode = get_theme()
+                    effective = "light" if mode == "light" else "dark"
+                    textarea.theme = "basicLight" if effective == "light" else "oneDark"
+                except (KeyError, ValueError):
+                    textarea.theme = "oneDark"
+
+            self._tab_widgets[tab.id]["panel"] = panel
+            self._tab_widgets[tab.id]["textarea"] = textarea
+            ui_state.textareas_by_tab[tab.id] = textarea
+
+            # Re-teach enablement needs the live anchor mirror, which the
+            # browser echoes only after the sim-completion notify has fired.
+            textarea.on_anchor_change(lambda _e: self._update_capture_button())
+
+            # Subscribe to LLM-edit lifecycle so the banner + diff overlay
+            # rebuild whenever propose / approve / reject fires.
+            self._subscribe_to_edits(tab)
+            self._refresh_edits_banner(tab.id)
+
+        return panel
+
+    def _subscribe_to_edits(self, tab: Program) -> None:
+        """Register a change listener on ``tab.edits`` for the lifetime of
+        the tab. The listener rebuilds the banner and the CodeMirror diff
+        overlay. Stored on ``self._tab_widgets`` so the matching close path
+        can remove it."""
+
+        def _on_edits_changed(tab_id: str = tab.id) -> None:
+            self._refresh_edits_banner(tab_id)
+            decorations.refresh_diff_overlay(tab_id)
+            self._on_new_edits(tab_id)
+
+        tab.edits.add_change_listener(_on_edits_changed)
+        self._tab_widgets[tab.id]["edits_listener"] = _on_edits_changed
+
+    def _on_new_edits(self, tab_id: str) -> None:
+        """React to *newly* proposed edits: flash their lines (like a
+        motion-recorder insert) and, in an auto-apply control mode, approve
+        them. Guards on a per-tab seen-set so the approve/reject that only
+        shrinks ``pending`` never re-flashes or re-applies.
+
+        Enters the captured page client (like ``_reconcile_tabs``) because an
+        edit proposed via an MCP tool fires this listener off the event loop
+        with no page context, and both the flash (``ui.timer``) and the
+        auto-approve UI push need one."""
+        tab = waldoctl.commander.programs.get(tab_id)
+        pending = list(tab.edits.pending) if tab is not None else []
+        current = {e.id.value for e in pending}
+        seen = self._seen_edit_ids.setdefault(tab_id, set())
+        new_ids = current - seen
+        self._seen_edit_ids[tab_id] = current
+        if not new_ids:
+            return
+        client = self._client
+        if client is None or client.is_deleted:
+            return
+        with client:
+            # Flash always (every mode) so an incoming edit is noticed, including
+            # when it's about to be auto-applied. Flashes target the active tab.
+            if tab_id == waldoctl.commander.programs.active_id:
+                lines = decorations.diff_touched_lines(tab_id, new_ids)
+                if lines:
+                    decorations.flash_editor_lines(lines)
+            if control_mode().auto_applies_edits:
+                for edit in pending:
+                    if edit.id.value in new_ids:
+                        self._approve_edit(tab_id, edit.id)
+
+    def auto_apply_pending_edits(self) -> None:
+        """Apply every pending edit across open tabs. Called when the control
+        mode switches to an auto-applying one, so edits proposed under Inspect
+        don't keep waiting for a click. Flashes like a fresh proposal."""
+        client = self._client
+        if client is None or client.is_deleted:
+            return
+        with client:
+            for tab in list(waldoctl.commander.programs.items):
+                pending = list(tab.edits.pending)
+                if not pending:
+                    continue
+                if tab.id == waldoctl.commander.programs.active_id:
+                    lines = decorations.diff_touched_lines(
+                        tab.id, {e.id.value for e in pending}
+                    )
+                    if lines:
+                        decorations.flash_editor_lines(lines)
+                for edit in pending:
+                    self._approve_edit(tab.id, edit.id)
+
+    def _unsubscribe_from_edits(self, tab_id: str) -> None:
+        """Remove the edit-lifecycle listener registered by
+        :meth:`_subscribe_to_edits`. Safe to call multiple times."""
+        widgets = self._tab_widgets.get(tab_id)
+        if not widgets:
+            return
+        listener = widgets.pop("edits_listener", None)
+        if listener is None:
+            return
+        tab = waldoctl.commander.programs.get(tab_id)
+        if tab is not None:
+            tab.edits.remove_change_listener(listener)
+
+    def _refresh_edits_banner(self, tab_id: str) -> None:
+        """Sync the header row's review cluster with the *active* tab's pending
+        edits. While one is pending the cluster (description + Approve/Reject)
+        swaps in for the toolbar buttons — Open/Save/Insert would mutate the
+        source under the diff. Edits queue up: one is shown at a time and
+        resolving it surfaces the next."""
+        active_id = waldoctl.commander.programs.active_id
+        if active_id is not None and tab_id != active_id:
+            return
+        row = self._edit_review_row
+        if row is None:
+            return
+        tab = waldoctl.commander.programs.get(active_id) if active_id else None
+        pending = list(tab.edits.pending) if tab is not None else []
+        row.clear()
+        row.set_visibility(bool(pending))
+        for btn in self._toolbar_btns:
+            btn.set_visibility(not pending)
+        if tab is None or not pending:
+            return
+        edit = pending[0]
+        tab_id = tab.id
+        with row:
+            label = edit.description or "(no description)"
+            # min-width:0 so the label truncates when the header is tight —
+            # otherwise the whole cluster wraps under the CodeMirror or pushes
+            # the Approve/Reject buttons off the panel.
+            ui.label(label).classes("text-xs truncate").style(
+                "max-width: 16rem; min-width: 0;"
+            ).tooltip(label).mark(f"edit-label-{edit.id.value}")
+            if len(pending) > 1:
+                ui.label(f"+{len(pending) - 1}").classes(
+                    "text-xs text-grey-6 whitespace-nowrap"
+                ).tooltip(f"{len(pending) - 1} more edit(s) queued")
+            ui.button(
+                icon="check",
+                on_click=lambda _e, eid=edit.id, tid=tab_id: self._approve_edit(
+                    tid, eid
+                ),
+            ).props("dense flat color=positive").mark(f"approve-edit-{edit.id.value}")
+            ui.button(
+                icon="close",
+                on_click=lambda _e, eid=edit.id, tid=tab_id: self._reject_edit(
+                    tid, eid
+                ),
+            ).props("dense flat color=negative").mark(f"reject-edit-{edit.id.value}")
+
+    def _approve_edit(self, tab_id: str, edit_id: EditId) -> None:
+        tab = waldoctl.commander.programs.get(tab_id)
+        if tab is None:
+            return
+        try:
+            tab.edits.approve(edit_id)
+        except ValueError as e:
+            ui.notify(f"Could not apply edit: {e}", color="warning")
+            return
+        except KeyError:
+            ui.notify("Edit no longer pending", color="info")
+            return
+        edit_decisions.record(edit_id.value, "applied")
+        # approve() rewrote tab.source; push it into CodeMirror so the visible
+        # editor matches (the value= arg is initial-only and the edit listener
+        # only rebuilds the banner/overlay). Without this the pane shows stale
+        # text and the next keystroke writes it back, destroying the edit.
+        widgets = self._tab_widgets.get(tab_id)
+        textarea = widgets.get("textarea") if widgets else None
+        if textarea is not None:
+            textarea.value = tab.source
+
+    def _reject_edit(self, tab_id: str, edit_id: EditId) -> None:
+        tab = waldoctl.commander.programs.get(tab_id)
+        if tab is None:
+            return
+        try:
+            tab.edits.reject(edit_id)
+        except KeyError:
+            return
+        edit_decisions.record(edit_id.value, "rejected")
+
+    def _reconcile_tabs(self) -> None:
+        """Render ``commander.programs`` into this page's tab bar — the single
+        widget build/teardown path, driven by *any* program mutation (a GUI
+        button or an MCP ``programs.*`` tool). Registered as a change listener
+        on ``commander.programs`` in :meth:`build`.
+
+        Runs on the event loop (the MCP program tools are async), so entering
+        the captured page client renders a mutation made outside a page action;
+        nested same-client entry during a GUI call is harmless.
+        """
+        client = self._client
+        if client is None or client.is_deleted:
+            if client is not None:
+                # The page is gone — stop listening so we don't touch dead UI.
+                waldoctl.commander.programs.remove_change_listener(self._reconcile_tabs)
+            return
+        if not self.tabs_container or not self.tab_panels_container:
+            return
+
+        with client:
+            programs = waldoctl.commander.programs
+            live_ids = {p.id for p in programs.items}
+            # Build widgets for newly-added programs.
+            for tab in programs.items:
+                widgets = self._tab_widgets.get(tab.id)
+                if widgets is None or "tab_element" not in widgets:
+                    self._create_tab_widget(tab)
+                    self._create_tab_panel(tab)
+            # Tear down widgets for programs that are gone.
+            for tab_id in list(self._tab_widgets):
+                if tab_id not in live_ids:
+                    self._remove_tab_widgets(tab_id)
+            # Follow the active program.
+            active_id = programs.active_id
+            if active_id and active_id in self._tab_widgets:
+                self.tab_panels_container.set_value(active_id)
+                self.tabs_container.set_value(active_id)
+                widgets = self._tab_widgets[active_id]
+                ui_state.active_textarea = widgets.get("textarea")
+                ui_state.active_filename_input = widgets.get("filename_input")
+                self._refresh_edits_banner(active_id)
+            self._update_capture_button()
+
+    def _on_editor_focus(self, tab: Program, e) -> None:
+        if e.focused:
+            self._focused_tab_ids.add(tab.id)
+        else:
+            self._focused_tab_ids.discard(tab.id)
+
+    def _on_cursor_line(self, tab: Program, e) -> None:
+        """Handle cursor line change from CodeMirror.
+
+        Only trusted while the editor is focused: every real cursor placement
+        happens focused, whereas unfocused selection-change events are echoes
+        of programmatic value updates and must not move the tracked cursor."""
+        if tab.id != waldoctl.commander.programs.active_id:
+            return
+        if tab.id not in self._focused_tab_ids:
+            return
+        tab.dry_run.playback.active_cursor_line = e.line
+        self._cursor_selection = None if e.empty else (e.from_line, e.to_line)
+        self._update_capture_button()
+        if ui_state.urdf_scene and waldoctl.commander.settings.view.paths_visible:
+            ui_state.urdf_scene.update_cursor_line_highlight()
+
+    def _on_tab_content_change(self, tab: Program, new_value: str) -> None:
+        """Handle content change for a tab."""
+        tab.source = new_value
+
+        self._update_dirty_dot(tab)
+
+        # Pending LLM-edit decorations are NOT re-pushed here: CodeMirror's
+        # decoration StateField maps the pushed specs through the human's
+        # edits client-side, and a re-push would snap them back to the diff's
+        # base coordinates. Only edit-flow changes (propose/approve/reject)
+        # re-render the overlay.
+
+        # Only run simulation for active tab
+        if tab.id == waldoctl.commander.programs.active_id:
+            simulation.schedule_debounced_simulation()
+
+    def build(self, close_callback: Callable | None = None) -> None:
+        """Build the program editor content with multi-tab support."""
+        try:
+            ui_client = ui.context.client
+        except RuntimeError:
+            ui_client = None
+        self._client = ui_client
+        self._focused_tab_ids.clear()
+        decorations.set_ui_client(ui_client)
+        playback.set_ui_client(ui_client)
+        script_exec.set_ui_client(ui_client)
+
+        # Periodic check: re-run path preview when robot position changes
+        ui.timer(1.0, simulation.check_position_changed)
+
+        with (
+            ui.column()
+            .classes("w-full h-full gap-0")
+            .style("height: 100%; min-height: 0; padding-bottom: 16px;")
+        ):
+            # ---- Header Row (title + tabs + cmd + X) ----
+            # no-wrap + min-width:0 on the tab scroller: the review cluster
+            # must stay on the header line (a wrapped second line paints
+            # underneath the CodeMirror), so the tab strip shrinks/scrolls
+            # instead of forcing a wrap.
+            with (
+                ui.row()
+                .classes("w-full items-center gap-2 px-2 no-wrap")
+                .style("height: 42px;")
+            ):
+                ui.label("Program").classes("text-lg font-medium whitespace-nowrap")
+
+                # Tabs area (horizontal scroll)
+                with (
+                    ui.scroll_area()
+                    .classes("flex-1 no-wrap items-start editor-tabs-scroll")
+                    .style("height: 42px; min-width: 0;")
+                ):
+                    with ui.row().classes("items-center gap-0 flex-nowrap"):
+                        self.tabs_container = (
+                            ui.tabs()
+                            .props("dense inline-label")
+                            .classes("editor-tabs")
+                            .on(
+                                "update:model-value",
+                                lambda e: self._switch_to_tab(e.args),
+                            )
+                        )
+
+                        # New tab button (last element in scrollable area)
+                        new_tab_btn = (
+                            ui.button(icon="add", on_click=lambda: self._new_tab())
+                            .props("flat dense color=white")
+                            .classes("ml-2")
+                            .tooltip("New Tab")
+                        )
+                        new_tab_btn.mark("editor-new-tab-btn")
+
+                self._edit_review_row = (
+                    ui.row()
+                    .classes("items-center no-wrap pending-edits-banner")
+                    .style("gap: 4px; min-width: 0;")
+                )
+                self._edit_review_row.set_visibility(False)
+
+                open_btn = (
+                    ui.button(icon="folder", on_click=self._show_open_dialog)
+                    .props("flat dense color=white")
+                    .classes("editor-toolbar-btn")
+                    .tooltip("Open")
+                )
+                open_btn.mark("editor-open-btn")
+
+                save_btn = (
+                    ui.button(icon="save", on_click=self._show_save_dialog)
+                    .props("flat dense color=white")
+                    .classes("editor-toolbar-btn")
+                    .tooltip("Save")
+                )
+                save_btn.mark("editor-save-btn")
+
+                commands_btn = (
+                    ui.button(icon="library_add")
+                    .props("flat dense color=white")
+                    .classes("editor-toolbar-btn")
+                    .tooltip("Insert Command")
+                )
+                commands_btn.mark("editor-commands-btn")
+                with commands_btn:
+                    self._build_command_menu()
+                self._toolbar_btns = [open_btn, save_btn, commands_btn]
+
+                if close_callback:
+                    ui.button(icon="close", on_click=close_callback).props(
+                        "flat round dense color=white"
+                    )
+
+            # ---- Splitter: Editor (before) | Playbar (separator) | Log (after) ----
+            # horizontal=True means vertical stacking (column layout)
+            with (
+                ui.splitter(
+                    horizontal=True,
+                    value=LOG_COLLAPSED_VALUE,
+                    limits=(50, LOG_COLLAPSED_VALUE),
+                    on_change=log_panel.on_splitter_change,
+                )
+                .classes("w-full flex-1 editor-splitter")
+                .style("overflow: hidden;") as splitter
+            ):
+                log_panel.attach_splitter(splitter)
+
+                # ---- Tab Panels Area (CodeMirror) in splitter.before ----
+                with splitter.before:
+                    self.tab_panels_container = (
+                        ui.tab_panels(self.tabs_container)
+                        .classes("w-full h-full")
+                        .props("animated")
+                        .style("padding: 0; overflow: hidden;")
+                    )
+
+                # ---- Playbar in splitter.separator (acts as handle) ----
+                with splitter.separator:
+                    self.playback.build_bar()
+
+                # ---- Shared Log Area in splitter.after ----
+                with splitter.after:
+                    log_panel.build_log_area()
+
+        self.playback.setup_timers()
+
+        # Render program mutations into this page's tab bar for the page's
+        # lifetime — whoever makes them (a GUI button or an MCP programs.* tool).
+        # add_change_listener dedups, and cleanup() drops it on disconnect.
+        waldoctl.commander.programs.add_change_listener(self._reconcile_tabs)
+        # Re-teach enablement tracks dry-run results, which refresh through
+        # this channel (sim completion, tab switch).
+        simulation_state.add_change_listener(self._update_capture_button)
+
+        # Restore tabs from existing state (page refresh) or create initial tab
+        if waldoctl.commander.programs.items:
+            # Drop stale references from a previous page load; the reconciler
+            # rebuilds every tab and follows the active one. Unsubscribe the
+            # edit listeners first — they live on the process-global tab.edits
+            # notifier, so clearing _tab_widgets without removing them leaks a
+            # closure set per page (re)build. active_id is set directly (not via
+            # _switch_to_tab, whose guards are for user-initiated switches).
+            for tab_id in list(self._tab_widgets):
+                self._unsubscribe_from_edits(tab_id)
+            self._tab_widgets.clear()
+            if not waldoctl.commander.programs.active_id:
+                waldoctl.commander.programs.active_id = (
+                    waldoctl.commander.programs.items[0].id
+                )
+            self._reconcile_tabs()
+
+            # Restore simulation state from active tab
+            if waldoctl.commander.programs.active is not None:
+                self._invalidate_for_tab_switch()
+        else:
+            self._new_tab()
