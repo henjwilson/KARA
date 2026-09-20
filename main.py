@@ -1,66 +1,85 @@
 import cv2
+import numpy as np
 
 # for drawing boxes
 from PIL import Image
 
-#
 from util import get_limits
 
 
-yellow = [0, 255, 255]  # yellow in RGB color space
-red = [255, 0, 0]
+# BGR Colors: (must be in BGR)
+orange = [0, 165, 255]
+yellow = [0, 255, 255]
+red = [0, 0, 255]
+blue = [255, 0, 0]
 
 # for video Capture. (webcam number) 0 if you only have 1 (default)
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(0)
 
-# Set manual exposure (value range depends on your specific camera driver)
+# Exposure Settings
 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)  # '0' typically means Manual Mode in V4L2/Linux (3 is Auto)
-# If on Windows/macOS and '1' does not work, try passing '0' or '0.25' instead.
-# 2. Now apply your manual exposure value
-cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # apply manual Exposure
 
-MIN_AREA = 500  #filter out tiny noise blobs
+#filter out tiny noise blobs
+MIN_AREA = 500
+
+# testing Resolution: (want the widest)
+resolutions_to_test = [(640, 480), (1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)]
+
+# IMPORTANT: we only care about the widest resolution
+max_width = 640
+for w, h in resolutions_to_test:
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    actual_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    actual_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    print(f"Requested {w}x{h}, got {actual_w}x{actual_h}")
+    if actual_w > max_width:
+        max_width = actual_w
+        max_height = actual_h
+print(f"Best resolution found: {max_width}x{max_height}")
+
+# set to the widest:
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, max_width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, max_height)
 
 while(True):
     ret, frame = cap.read() # read from camera
-
     # ---------- Color Detection ----------
-        # Convert VGR color space to RGB:
+
     # convert input image from VGR color space to HSV
     hsvImage = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Specify Yellow
-    lowerLimit, upperLimit = get_limits(color=yellow)
+    # Specify color
+    lowerLimit, upperLimit = get_limits(color=blue)
 
     # returns all the pixels of the color we want
     mask = cv2.inRange(hsvImage, lowerLimit, upperLimit)
-
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.erode(mask, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    # cv2.imshow('mask', mask)
     # ---------- End Color Detection ----------
 
     # ---------- Draw Bounding Boxes (per separate blob) ----------
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     for contour in contours:
         if cv2.contourArea(contour) < MIN_AREA:
             continue  # skip small noise
 
         x, y, w, h = cv2.boundingRect(contour)
+        # draw green rectangle around Object
         frame = cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 5)
+        # Calculate center point
+        center_x = x + w // 2
+        center_y = y + h // 2
+        # Draw a dot at the center
+        cv2.circle(frame, (center_x, center_y), 5, (0, 0, 255), -1)
+        # Display the coordinates as text near the dot
+        coord_text = f"({center_x}, {center_y})"
+        cv2.putText(frame, coord_text, (center_x + 10, center_y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
     # ---------- End Draw Bounding Boxes ----------
-
-    # converting immage from opencv array to pill array
-    # mask_ = Image.fromarray(mask)
-    # get the bounding box
-    # bbox = mask_.getbbox()
-
-    # if bbox is not None:
-        # x1, y1, x2, y2, = bbox
-
-        # draw rectangle: frame, (top corner), (bottom corner), color (green), line thickness
-        ## frame = cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 5)
-
-        # print(bbox)
-    # ---------- Draw Bounding Box ----------
 
     # Show the frame
     cv2.imshow('frame', frame)
