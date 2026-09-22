@@ -1,0 +1,81 @@
+Waldo-Commander Setup — macOS
+================================
+
+1. Clone the repo
+------------------
+git clone https://github.com/Jepson2k/Waldo-Commander.git
+cd Waldo-Commander
+
+2. Create and activate a fresh virtual environment
+----------------------------------------------------
+python3 -m venv venv
+source venv/bin/activate
+
+3. Pin the git dependencies (avoids pip silently swapping in PyPI versions)
+-----------------------------------------------------------------------------
+Create constraints.txt in the project root:
+
+cat > constraints.txt << 'EOF'
+nicegui @ git+https://github.com/Jepson2k/nicegui.git@be1d73b526883fd4dfbcaf2747814079e9d47ef2
+waldoctl @ git+https://github.com/Jepson2k/waldoctl.git
+EOF
+
+4. Install the project with the constraints applied
+--------------------------------------------------------
+pip install -e ".[parol6]" -c constraints.txt
+
+Verify the pins actually took:
+pip freeze | grep -i nicegui
+pip freeze | grep -i waldoctl
+python -c "from nicegui.elements import codemirror; from nicegui.elements.scene import scene_object3d; print('nicegui OK')"
+python -c "from waldoctl.shapes import param_names; print('waldoctl OK')"
+
+5. Find the robot's serial port (plug in the robot first)
+--------------------------------------------------------------
+ls /dev/cu.usbmodem*
+
+(On this machine it showed up as /dev/cu.usbmodem3075384934331)
+
+IMPORTANT (macOS only): use the /dev/cu.* device, not /dev/tty.*.
+Both paths point to the same physical port, but /dev/tty.* waits on a
+carrier-detect signal before opening and can hang/silently fail with
+some USB-serial boards, causing the app to fall back to simulator mode
+with no error. /dev/cu.* opens immediately and is the one to use.
+
+6. Launch with the port set
+-------------------------------
+export PAROL6_COM_PORT=/dev/cu.usbmodemXXXXXXXXXXXXX
+waldo-commander
+
+Or persist the port instead of exporting it each time:
+echo "/dev/cu.usbmodemXXXXXXXXXXXXX" > com_port.txt
+waldo-commander
+
+Open the printed URL (e.g. http://localhost:8080) in a browser.
+
+7. If it still won't move the real arm (silent simulator fallback)
+--------------------------------------------------------------------
+Force the app to fail loudly instead of quietly using simulator mode:
+
+pkill -f waldo-commander
+export PAROL6_COM_PORT=/dev/cu.usbmodemXXXXXXXXXXXXX
+export PAROL_WEBAPP_AUTO_SIMULATOR=0
+export PAROL_LOG_LEVEL=DEBUG
+waldo-commander
+
+Watch startup output for an explicit connect success/failure message.
+
+8. Test motion from a standalone script (bypasses the web UI entirely)
+--------------------------------------------------------------------------
+from parol6 import RobotClient
+
+rbt = RobotClient(host='127.0.0.1', port=5001)
+print('Before:', rbt.angles())
+rbt.move_j(joint=[100.0, -90.0, 180.0, 0.0, 0.0, 180.0], speed=0.2)
+print('After:', rbt.angles())
+
+Note: the in-app code editor's "play" button runs code in an isolated
+preview/simulation sandbox for visualizing the path — it does not
+send commands to the real robot. Use a standalone script like the
+one above, or find a distinct "Run on robot" control if one exists,
+to actually move the hardware.
