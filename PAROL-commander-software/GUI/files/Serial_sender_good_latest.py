@@ -31,10 +31,7 @@ my_os = platform.system()
 if my_os == "Windows":
     Image_path = os.path.join(os.path.dirname(os.path.realpath(__file__)))
     logging.debug("Os is Windows")
-elif my_os == "Darwin":
-    Image_path = os.path.join(os.path.dirname(os.path.realpath(__file__)))
-    logging.debug("OS is macOS")
-elif my_os == "Linux": 
+else: 
     Image_path = os.path.join(os.path.dirname(os.path.realpath(__file__)))
     logging.debug("Os is Linux")
 
@@ -58,14 +55,6 @@ if my_os == "Windows":
         ser = serial.Serial(port=str_port, baudrate=3000000, timeout=0)
     except:
         ser = serial.Serial()
-elif my_os == "Darwin":
-    try:
-        #str_port = '/dev/ttyACM' + str(STARTING_PORT) 
-        str_port = '/dev/cu.usbmodem3878346834331' #see platformio for the device
-        ser = serial.Serial(port=str_port, baudrate=3000000, timeout=0)
-        print(f"Connecté au mac sur le port: {str_port}")
-    except:
-        ser = serial.Serial() 
 elif my_os == "Linux":
     try:
         str_port = '/dev/ttyACM' + str(STARTING_PORT)
@@ -82,7 +71,6 @@ int_to_3_bytes = struct.Struct('>I').pack # BIG endian order
 #######################################################################################
 start_bytes =  [0xff,0xff,0xff] 
 start_bytes = bytes(start_bytes)
-
 
 end_bytes =  [0x01,0x02] 
 end_bytes = bytes(end_bytes)
@@ -1841,27 +1829,22 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                 Robot_mode = "Dummy"
                 dummy_data(Position_out,Speed_out,Command_out,Position_in)
 
-            # Provjere
+            # Provjere 
             # Svaka move funkciaj će imati svoje provjere!
             # Tu će samo biti zadnja provjera koja gleda brzine i ako su pre velike stavlja ih na nula!
             time2 = time.perf_counter()
 
             
             
-   
-
         else:
             try:
-
-                if my_os == "Linux":
-                    com_port = "/dev/ttyACM" + str(General_data[0])
-
-                elif my_os == "Darwin":
-                    com_port = "/dev/cu.usbmodem3075384934331"
-
-                elif my_os == "Windows":
-                    com_port = "COM" + str(General_data[0])
-
+                
+                
+                if my_os == 'Linux':
+                    com_port = '/dev/ttyACM' + str(General_data[0])
+                elif my_os == 'Windows':
+                    com_port = 'COM' + str(General_data[0])
+                    
                 print(com_port)
                 ser.port = com_port
                 ser.baudrate = 3000000
@@ -1869,13 +1852,13 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                 time.sleep(0.5)
                 ser.open()
                 time.sleep(0.5)
-
-            except Exception as error:
-                print("Serial reconnect error:", error)
+            except:
                 time.sleep(0.5)
-                logging.debug("no serial available, reconnecting!")
+                logging.debug("no serial available, reconnecting!")   
 
         timer.checkpt()
+
+
 def dummy_data(Position_out,Speed_out,Command_out,Position_in):
     Command_out.value = 255
     for i in range(6):
@@ -1931,9 +1914,6 @@ def Task2(shared_string,Position_in,Speed_in,Homed_in,InOut_in,Temperature_error
                     com_port = '/dev/ttyACM' + str(General_data[0])
                 elif my_os == 'Windows':
                     com_port = 'COM' + str(General_data[0])
-
-                elif my_os == 'Darwin':
-                    com_port = '/dev/cu.usbmodem3075384934331'
                     
                 
                 print(com_port)
