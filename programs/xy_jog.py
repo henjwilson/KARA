@@ -32,11 +32,11 @@ HOME_TOLERANCE_DEG = 2.0
 Z = 180
 RX, RY, RZ = 90, 0, 90
 
-X_BOUNDS = (-300, 300)
-# Y_BOUNDS = (15, 400)
-Y_BOUNDS = (-130, -10)
+X_BOUNDS = (-300, 500)
+Y_BOUNDS = (50, 400)
+# Y_BOUNDS = (-130, -10)
 
-MOVE_SPEED = 0.5
+MOVE_SPEED = 0.3
 
 
 def in_bounds(x: float, y: float) -> bool:
@@ -52,6 +52,18 @@ def connect_and_home(rbt: RobotClient) -> None:
         rbt.home(wait=True)
     print(f"Ready. X bounds {X_BOUNDS}, Y bounds {Y_BOUNDS}.")
     print("Type 'x,y' to move (e.g. 100,300), 'home' to return home, or 'quit' to exit.")
+
+# move to target:
+def move_to(rbt, x, y, z=Z, rx=RX, ry=RY, rz=RZ, speed=MOVE_SPEED):
+    pose = [x, y, z, rx, ry, rz]
+    try:
+        rbt.move_l(pose, speed=speed)
+        return "straight"
+    except MotionError as e:
+        print(f"Straight-line path rejected ({e}); retrying with move_j")
+        rbt.move_j(pose=pose, speed=speed)
+        return "curved"
+
 
 
 def main() -> None:
@@ -89,8 +101,9 @@ def main() -> None:
                 continue
             try:
                 # rbt.move_l([x, y, Z, RX, RY, RZ], speed=MOVE_SPEED)
-                rbt.move_j([x, y, Z, RX, RY, RZ], speed=MOVE_SPEED)
-                print(f"pose (X, Y, Z, Rx, Ry, Rz): {rbt.pose()}")
+                # rbt.move_j([x, y, Z, RX, RY, RZ], speed=MOVE_SPEED)
+                # print(f"pose (X, Y, Z, Rx, Ry, Rz): {rbt.pose()}")
+                move_to(rbt, x, y, Z, RX, RY, RZ, MOVE_SPEED)
             except MotionError as e:
                 print(f"Motion rejected: {e}")
             except Exception as e:
