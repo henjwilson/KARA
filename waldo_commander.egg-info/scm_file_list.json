@@ -29,6 +29,7 @@
     "programs/cycle_start.py",
     "programs/demo_showcase.py",
     "programs/draw_circle.py",
+    "programs/map_workspace.py",
     "programs/precision.py",
     "programs/speed_comparison.py",
     "programs/xy_jog.py",

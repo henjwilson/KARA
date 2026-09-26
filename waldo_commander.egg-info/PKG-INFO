@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: waldo-commander
-Version: 0.1.dev4+gfaea6524a.d20260922
+Version: 0.1.dev5+gd982c8c77.d20260925
 Summary: A web interface for controlling robotic arms
 License-Expression: Apache-2.0
 Requires-Python: >=3.12
