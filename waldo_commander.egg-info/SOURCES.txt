@@ -34,6 +34,7 @@ programs/xy_jog.py
 programs/zigzag_scan.py
 programs/.runtime/untitled.py
 programs/.runtime/zigzag_scan.py
+programs/workspace_mapping/ik_mapping.py
 tests/__init__.py
 tests/conftest.py
 tests/test_app_smoke.py

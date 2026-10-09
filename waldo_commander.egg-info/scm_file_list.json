@@ -32,6 +32,7 @@
     "programs/map_workspace.py",
     "programs/precision.py",
     "programs/speed_comparison.py",
+    "programs/workspace_mapping/ik_mapping.py",
     "programs/xy_jog.py",
     "programs/zigzag_scan.py",
     "pyproject.toml",

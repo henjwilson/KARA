@@ -40,8 +40,8 @@ TOOL = "SSG-48"
 HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
 HOME_TOLERANCE_DEG = 2.0
 
-JOG_SPEED = 0.25   # fraction of each joint's max speed (0.0 - 1.0)
-JOG_ACCEL = 1.0    # fraction of max accel (0.0 - 1.0)
+JOG_SPEED = 0.1   # fraction of each joint's max speed (0.0 - 1.0)
+JOG_ACCEL = .3    # fraction of max accel (0.0 - 1.0)
 LOOP_HZ = 20        # how often we poll held keys and refresh the jog command
 
 # jog_j() only moves for `duration` seconds unless it's refreshed, so we make
@@ -113,6 +113,7 @@ def main() -> None:
     listener.start()
 
     was_moving = False
+    tick_count = 0
     try:
         while not quit_requested:
             if HOME_KEY in pressed_keys:
@@ -133,10 +134,12 @@ def main() -> None:
                 if neg_key in pressed_keys:
                     active_joint, direction = joint_idx, -1
                     break
-
             if active_joint is not None:
                 rbt.jog_j(active_joint, speed=JOG_SPEED * direction, duration=JOG_DURATION, accel=JOG_ACCEL)
                 was_moving = True
+                tick_count += 1
+                if tick_count % 10 == 0:
+                    print(f"Actual pose: {rbt.pose()}")
             elif was_moving:
                 # Key released since the last tick -> stop immediately
                 rbt.stop()

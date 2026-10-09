@@ -1,17 +1,13 @@
-import math
+import time
 from parol6 import RobotClient
 
 rbt = RobotClient()
 
-HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
-HOME_TOLERANCE_DEG = 2.0
-
-# Select tool, and home only if not already near the home pose
-rbt.select_tool("SSG-48")
-rbt.tool.calibrate()
-current = rbt.angles()
-if (
-    current is None
-    or max(abs(a - h) for a, h in zip(current, HOME_ANGLES)) > HOME_TOLERANCE_DEG
-):
-    rbt.home()
+print("Moving to home position...")
+rbt.home()
+# x, y, z, rx, ry, rz
+# 90.0, -90.0, 180.0, 0.0, 0.0, 180.0
+pose = [90.0, -90.0, 180.0, 0.0, 0.0, 90]
+speed = 0.3
+rbt.move_l([90.00, -90.00, 180.00, 0.00, 0.00, 90.00], speed=0.2, accel=0.2)  # Recording start position
+# rbt.move_l(pose, speed=speed)

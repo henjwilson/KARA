@@ -26,7 +26,7 @@ TOOL = "SSG-48"
 HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
 HOME_TOLERANCE_DEG = 2.0
 
-Z, RX, RY, RZ = 150, 90, 0, 90
+Z, RX, RY, RZ = 8, 90, 0, 90
 
 # Grid to sweep - tune this. Wider range / smaller step = slower but more precise.
 X_RANGE = range(-350, 351, 25)
