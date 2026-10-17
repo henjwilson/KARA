@@ -2099,7 +2099,7 @@ class ControlPanel:
             joint_tab = ui.tab("Joint Jog").mark("tab-joint")
             cart_tab = ui.tab("Cartesian Jog").mark("tab-cartesian")
             settings_tab = ui.tab("Settings").mark("tab-settings")
-        jog_mode_tabs.value = joint_tab
+        jog_mode_tabs.value = cart_tab
         self._jog_mode_tabs = jog_mode_tabs
 
         # Tab change handler to update step input suffix/tooltip
@@ -2417,6 +2417,19 @@ class ControlPanel:
 
                 # Initialize axis->element mapping and ensure visuals reflect current assignment
                 self._refresh_cartesian_icons()
+
+                with ui.row().classes("w-full justify-center items-center gap-2 mt-1"):
+                    ui.label("Hold to jog").classes("text-xs opacity-60")
+                    for keys, axis in (
+                        ("W / S", "Y"),
+                        ("A / D", "X"),
+                        ("Q / E", "Z"),
+                    ):
+                        with ui.row().classes("items-center gap-1"):
+                            ui.label(keys).classes(
+                                "text-xs font-mono rounded px-2 py-1 bg-white/10"
+                            )
+                            ui.label(axis).classes("text-xs opacity-60")
 
             # Settings panel
             with ui.tab_panel(settings_tab).classes("gap-0 p-0"):
@@ -2741,7 +2754,7 @@ class ControlPanel:
                         max=100.0,
                         step=1,
                         format="%.1f",
-                        suffix="°",
+                        suffix="mm",
                     )
                     .props(
                         'dense borderless hide-bottom-space input-style="text-align:right"'
@@ -2750,7 +2763,7 @@ class ControlPanel:
                     .bind_value(waldoctl.commander.settings.jog, "joint_step_deg")
                 )
                 with self._step_input:
-                    self._step_input_tooltip = ui.tooltip("Step size in degrees")
+                    self._step_input_tooltip = ui.tooltip("Step size in mm")
 
             ui.button(
                 icon="dangerous", color="negative", on_click=self.on_estop_click

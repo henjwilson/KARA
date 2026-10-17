@@ -13,8 +13,7 @@ HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
 HOME_TOLERANCE_DEG = 2.0
 
 # Select tool, and home only if not already near the home pose
-rbt.select_tool("SSG-48")
-rbt.tool.calibrate()
+rbt.select_tool("PNEUMATIC", "vertical")
 current = rbt.angles()
 if (
     current is None
@@ -26,10 +25,10 @@ PRECISION_POSE = [0, -250, 350, -90, 0, -90]
 rbt.move_j(pose=PRECISION_POSE, speed=0.5)
 
 # Test gripper: two quick close/open cycles
-rbt.tool.close(speed=1.0)
-rbt.tool.open(speed=1.0)
-rbt.tool.close(speed=1.0)
-rbt.tool.open(speed=1.0)
+rbt.tool.close()
+rbt.tool.open()
+rbt.tool.close()
+rbt.tool.open()
 
 # Approach pencil: move_j to 100mm above, descend linearly, grab, retract
 PENCIL_ABOVE = [-90, -81.6, 161.8, 0, -69.4, 180]

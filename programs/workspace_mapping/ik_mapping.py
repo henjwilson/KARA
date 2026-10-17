@@ -10,7 +10,7 @@ from parol6.utils.errors import MotionError
 # Config
 # ---------------------------------------------------------------------------
 HOST, PORT = "127.0.0.1", 5001
-TOOL = "SSG-48"
+TOOL, TOOL_VARIANT = "PNEUMATIC", "vertical"
 
 HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
 HOME_TOLERANCE_DEG = 2.0

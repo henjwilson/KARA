@@ -21,7 +21,7 @@ from parol6.utils.errors import MotionError
 # Config
 # ---------------------------------------------------------------------------
 HOST, PORT = "127.0.0.1", 5001
-TOOL = "SSG-48"
+TOOL, TOOL_VARIANT = "PNEUMATIC", "vertical"
 
 HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
 HOME_TOLERANCE_DEG = 2.0
@@ -37,8 +37,7 @@ REHOME_EVERY = 40  # re-home every N attempts to avoid drifting into a weird con
 
 
 def connect_and_home(rbt: RobotClient) -> None:
-    rbt.select_tool(TOOL)
-    rbt.tool.calibrate()
+    rbt.select_tool(TOOL, TOOL_VARIANT)
     current = rbt.angles()
     if current is None or max(abs(a - h) for a, h in zip(current, HOME_ANGLES)) > HOME_TOLERANCE_DEG:
         rbt.home(wait=True)
