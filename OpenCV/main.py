@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -351,12 +352,14 @@ def refine_calibration(path: Path, coords_csv: Path = COORDS_CSV) -> None:
     since = datetime.fromisoformat(data.get("updated_utc", data["created_utc"]))
     with coords_csv.open(newline="", encoding="utf-8") as coords_file:
         rows = [r for r in csv.DictReader(coords_file) if r.get("timestamp")]
-    robot = [r for r in rows if r.get("source") == "robot"]
-    camera = [r for r in rows if r.get("source") == "camera"
-              and datetime.fromisoformat(r["timestamp"]) >= since]
-    skipped = sum(1 for r in rows if r.get("source") == "camera") - len(camera)
+    # Rows from before the map last changed belong to pairs already used, so
+    # an old robot row must not be paired with a new camera row.
+    recent = [r for r in rows if datetime.fromisoformat(r["timestamp"]) >= since]
+    robot = [r for r in recent if r.get("source") == "robot"]
+    camera = [r for r in recent if r.get("source") == "camera"]
+    skipped = len(rows) - len(recent)
     if skipped:
-        print(f"Ignoring {skipped} camera row(s) taken before the calibration "
+        print(f"Ignoring {skipped} row(s) taken before the calibration "
               "last changed (they used an older map).")
 
     def xy(row: dict) -> np.ndarray:
@@ -454,7 +457,14 @@ def aruco_border(detections: list[dict], fallback: np.ndarray) -> np.ndarray:
 
 class BlockTracker:
     """Suppress flickering noise by only reporting blocks seen in several
-    consecutive frames near the same image position."""
+    consecutive frames near the same image position.
+
+    Each reported block gets ``steady_contact_xy``: the median ``contact_xy``
+    over the last ``confirm_frames`` frames, using only frames where the top
+    face was found, since the no-top-face fallback can be off by about half
+    the block's height. It is None until at least half of those frames found
+    the top face.
+    """
 
     def __init__(self, confirm_frames: int, max_jump_px: float = 25.0):
         self.confirm_frames = confirm_frames
@@ -467,12 +477,21 @@ class BlockTracker:
         for block in blocks:
             center = np.asarray(block["center_xy"])
             hits = 1
+            history: deque = deque(maxlen=self.confirm_frames)
             if unmatched:
                 distances = [np.linalg.norm(t["center"] - center) for t in unmatched]
                 nearest = int(np.argmin(distances))
                 if distances[nearest] <= self.max_jump_px:
-                    hits = unmatched.pop(nearest)["hits"] + 1
-            tracks.append({"center": center, "hits": hits, "block": block})
+                    track = unmatched.pop(nearest)
+                    hits, history = track["hits"] + 1, track["history"]
+            history.append(block["contact_xy"] if block["top_found"] else None)
+            top_samples = [xy for xy in history if xy is not None]
+            block["steady_contact_xy"] = (
+                tuple(float(v) for v in np.median(top_samples, axis=0))
+                if 2 * len(top_samples) >= self.confirm_frames else None
+            )
+            tracks.append({"center": center, "hits": hits, "history": history,
+                           "block": block})
         self.tracks = tracks
         return [t["block"] for t in tracks if t["hits"] >= self.confirm_frames]
 

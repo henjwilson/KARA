@@ -1,17 +1,19 @@
-"""Watch the table for yellow blocks; hover the robot above each one, then home.
+"""Watch the table for yellow blocks; pick each one up and drop it at home.
 
 Setup:
     Run `parol6-server` in a separate terminal FIRST, then run this script
-    from the repo's `.venv` (it needs both parol6 and OpenCV). Add
-    `--calibrate` to calibrate the camera first (same as main.py's):
+    from the repo's `.venv` (it needs both parol6 and OpenCV). It needs
+    drop-calibrate pairs taken with the current camera calibration, so run
+    `programs/drop_calibrate.py` first:
 
-        .venv/bin/python OpenCV/seek_yellow.py --camera 0 --calibrate
+        .venv/bin/python OpenCV/seek_yellow.py --camera 0
 
-Each cycle: wait for a confirmed yellow block inside the ArUco border, move
-straight to its XY at TARGET_HEIGHT_MM above the calibrated table surface
-there (the table isn't level in robot coordinates), wait DWELL_S, and home. Blocks
-already visited are skipped until they move. Press Q in the camera window to
-stop.
+Each cycle: wait for a confirmed yellow block inside the ArUco border, turn
+its camera position into robot XY with the drop-calibrate correction, and
+plan a gripper orientation the same way drop_calibrate.py does. The arm
+moves SAFE_HEIGHT_MM above the block, descends straight down to the TCP
+height the drop-calibrate releases had there, grips, lifts, homes, and opens
+the gripper to drop the block. Press Q in the camera window to stop.
 """
 
 from __future__ import annotations
@@ -28,9 +30,9 @@ import numpy as np
 import parol6.PAROL6_ROBOT as PAROL6_ROBOT
 from parol6 import RobotClient
 from parol6.utils.errors import MotionError
-from parol6.utils.ik import solve_ik
 
 from main import (
+    COORDS_CSV,
     DEFAULT_CALIBRATION,
     DICTIONARIES,
     BlockTracker,
@@ -44,25 +46,30 @@ from main import (
     marker_overlay,
     run_calibration,
 )
+from placement import (
+    HOST,
+    PORT,
+    TOOL,
+    TOOL_VARIANT,
+    GripperError,
+    Plan,
+    load_drop_correction,
+    plan_point,
+    set_gripper,
+)
 from util import detect_colored_blocks
 
-HOST, PORT = "127.0.0.1", 5001
-TOOL, TOOL_VARIANT = "PNEUMATIC", "vertical"
-HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
-
-TARGET_HEIGHT_MM = 30.0  # TCP height above the table surface
-DWELL_S = 2.0
+# Matches drop_calibrate.py's default, so picks use the orientations its
+# placements were checked with.
+SAFE_HEIGHT_MM = 50.0
 MOVE_SPEED = 0.3
+# Near the table, and while carrying the block, move slowly.
+SLOW_SPEED = 0.1
 # A block within this distance of one already visited is the same block.
 VISITED_RADIUS_MM = 25.0
 # A visited spot empty for this many frames is forgotten, so a new block
 # placed there gets picked up.
 FORGET_AFTER_FRAMES = 30
-
-# Gripper attitude used when the calibration markers were touched; the
-# headings searched below rotate it about the vertical axis only.
-_TOUCH_ROTATION = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
-HEADING_OFFSETS_DEG = sorted(range(-180, 180, 10), key=abs)
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,55 +84,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-fill", type=float, default=0.6)
     parser.add_argument("--confirm-frames", type=int, default=10,
                         help="Frames a block must be seen before the robot goes to it")
+    parser.add_argument("--drop-pairs", type=int, default=23,
+                        help="Use only the most recent N drop-calibrate pairs "
+                             "(one full drop_calibrate run is 23)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Detect and solve IK, but do not move the robot")
+                        help="Detect and plan, but do not move the robot")
     add_calibration_args(parser)
     return parser.parse_args()
 
 
-def _rot_z(deg: float) -> np.ndarray:
-    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def solve_hover(x: float, y: float, z: float) -> list[float] | None:
-    """Joint angles (deg) putting the TCP at (x, y, z) mm, or None if unreachable.
-
-    The gripper's touch attitude points it toward the robot base; the heading
-    nearest that which IK can reach (seeded from home) is used.
-    """
-    seed = np.radians(HOME_ANGLES)
-    # _TOUCH_ROTATION's tool-Z column is -Y, i.e. heading -90 deg.
-    base_heading = math.degrees(math.atan2(-y, -x)) + 90.0
-    target = np.eye(4)
-    target[:3, 3] = (x / 1000.0, y / 1000.0, z / 1000.0)
-    for offset in HEADING_OFFSETS_DEG:
-        target[:3, :3] = _rot_z(base_heading + offset) @ _TOUCH_ROTATION
-        result = solve_ik(PAROL6_ROBOT.robot, target, seed, quiet_logging=True)
-        if result.success:
-            return np.degrees(result.q).tolist()
-    return None
-
-
-def table_z(z_plane: np.ndarray, x: float, y: float) -> float:
-    return float(z_plane[0] * x + z_plane[1] * y + z_plane[2])
-
-
-def visit(rbt: RobotClient | None, x: float, y: float, z: float,
-          angles: list[float]) -> None:
-    """Move straight to the block's target pose, wait, and home."""
-    print(f"Going to yellow at X={x:.1f} Y={y:.1f} Z={z:.1f} mm")
+def pick_and_drop(rbt: RobotClient | None, x: float, y: float, z: float,
+                  plan: Plan) -> None:
+    """Pick the block at (x, y) with the TCP at height z, then drop it at home."""
+    print(f"Picking yellow at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
     if rbt is None:
-        time.sleep(DWELL_S)
+        time.sleep(1.0)
         return
+    above = None
     try:
-        rbt.move_j(angles, speed=MOVE_SPEED, wait=True)
-        time.sleep(DWELL_S)
-    except (MotionError, TimeoutError) as exc:
-        print(f"Move failed ({exc}); returning home.")
-    finally:
+        rbt.move_j(plan.angles, speed=MOVE_SPEED, wait=True, timeout=30.0)
+        above = rbt.pose(frame="WRF")
+        if above is None:
+            raise TimeoutError("pose unavailable above the block")
+        rbt.move_l([x, y, z, *above[3:]], speed=SLOW_SPEED, wait=True, timeout=30.0)
+        set_gripper(rbt, close=True)
+        rbt.move_l(above, speed=SLOW_SPEED, wait=True, timeout=30.0)
         rbt.home(wait=True)
-        print("Home. Looking for another yellow block...")
+        set_gripper(rbt, close=False)
+        print("Dropped at home. Looking for another yellow block...")
+    except (MotionError, TimeoutError, GripperError) as exc:
+        print(f"Pick failed ({exc}); returning home.")
+        try:
+            if above is not None:
+                rbt.move_l(above, speed=SLOW_SPEED, wait=True, timeout=30.0)
+            rbt.home(wait=True)
+            set_gripper(rbt, close=False)
+        except (MotionError, TimeoutError, GripperError) as home_exc:
+            print(f"Could not get home ({home_exc}); stop and check the arm.")
 
 
 def main() -> None:
@@ -151,6 +146,12 @@ def main() -> None:
     calibration = load_calibration(
         args.calibration, (frame.shape[1], frame.shape[0]), args.dictionary
     )
+    try:
+        correction = load_drop_correction(args.calibration, COORDS_CSV, args.drop_pairs)
+    except SystemExit:
+        camera.release()
+        raise
+    print(correction.summary())
     rbt = None
     if not args.dry_run:
         rbt = RobotClient(host=HOST, port=PORT)
@@ -159,8 +160,12 @@ def main() -> None:
             rbt.wait_command(tool_index)
         print("Homing...")
         rbt.home(wait=True)
+        set_gripper(rbt, close=False)
     homography = calibration["pixel_to_robot_xy"]
-    z_plane = np.asarray(calibration["table_z_plane"], dtype=float)
+
+    def to_robot(pixel_xy: tuple[float, float]) -> tuple[float, float]:
+        return correction.to_robot(map_xy(pixel_xy, homography))
+
     border = cv2.convexHull(np.asarray(
         [m["image_xy"] for m in calibration["markers"]], dtype=np.float32
     ))
@@ -187,7 +192,7 @@ def main() -> None:
             )
             blocks = tracker.update(raw)
             if not busy:
-                seen = [map_xy(b["contact_xy"], homography) for b in raw]
+                seen = [to_robot(b["contact_xy"]) for b in raw]
                 for spot in list(visited):
                     if any(math.dist(spot, s) <= VISITED_RADIUS_MM for s in seen):
                         visited[spot] = 0
@@ -201,7 +206,8 @@ def main() -> None:
             cv2.polylines(view, [np.rint(border).astype(np.int32)], True, (255, 160, 0), 2)
             target = None
             for block in blocks:
-                x, y = map_xy(block["contact_xy"], homography)
+                steady = block["steady_contact_xy"]
+                x, y = to_robot(steady or block["contact_xy"])
                 done = any(math.dist((x, y), p) <= VISITED_RADIUS_MM
                            for p in [*visited, *unreachable])
                 if block["top_found"]:
@@ -214,10 +220,12 @@ def main() -> None:
                 tx, ty = block["top_xy"]
                 cv2.circle(view, (round(tx), round(ty)), 5, dot, -1)
                 left, top, _, _ = block["bbox"]
-                mode = "top" if block["top_found"] else "no top face"
+                # A block whose top face is rarely found is shown but not
+                # picked: its position is only a rough estimate.
+                mode = "top" if steady else "no top face, waiting"
                 cv2.putText(view, f"({mode}) X{x:.0f} Y{y:.0f}", (left, max(20, top - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-                if not done and target is None:
+                if steady and not done and target is None:
                     target = (x, y)
             status = "ROBOT MOVING" if busy else "SEARCHING"
             cv2.putText(view, f"{status} | visited {len(visited)}", (18, 30),
@@ -226,15 +234,15 @@ def main() -> None:
 
             if target is not None:
                 x, y = target
-                z = table_z(z_plane, x, y) + TARGET_HEIGHT_MM
-                angles = solve_hover(x, y, z)
-                if angles is None:
+                z = correction.pick_z(x, y)
+                plan = plan_point(x, y, z, SAFE_HEIGHT_MM)
+                if plan is None:
                     print(f"Yellow at X={x:.1f} Y={y:.1f} is out of reach; skipping.")
                     unreachable.append(target)
                 else:
                     visited[target] = 0
                     robot_job = threading.Thread(
-                        target=visit, args=(rbt, x, y, z, angles), daemon=True
+                        target=pick_and_drop, args=(rbt, x, y, z, plan), daemon=True
                     )
                     robot_job.start()
 

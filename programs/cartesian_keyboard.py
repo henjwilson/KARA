@@ -6,7 +6,8 @@ its limit switch again). Hold one movement key at a time. Press P to print the
 current pose or C to save it to ``cartesian_coords.csv`` next to this script.
 Press Y to find yellow blocks with the camera (top-face center, mapped to
 robot XY with OpenCV/table_calibration.json) and save those to the CSV too;
-the ``source`` column tells robot rows from camera rows.
+the ``source`` column tells robot rows from camera rows. Press V to open
+the gripper and B to close it.
 
 With Rx free (off by default; set RX_FREE or toggle with R), WRF translation
 keys treat Rx as a don't-care: X/Y/Z move while Ry and Rz stay fixed, and Rx
@@ -121,7 +122,7 @@ def on_press(key: keyboard.Key | keyboard.KeyCode):
             pressed_keys.add(name)
             if name == "space":
                 pressed_keys.difference_update(JOG_KEYS)
-            if name in {"h", "g", "p", "c", "y", "[", "]", "-", "=", "f", "r"}:
+            if name in {"h", "g", "p", "c", "y", "v", "b", "[", "]", "-", "=", "f", "r"}:
                 pending_actions.add(name)
     return None
 
@@ -300,6 +301,20 @@ def _save_yellow(camera: YellowCamera) -> None:
         print(f"Saved {len(points)} camera point(s) to {path}")
 
 
+def _set_gripper(rbt: RobotClient, close: bool) -> None:
+    action = "Closing" if close else "Opening"
+    print(f"{action} gripper...")
+    try:
+        result = rbt.tool.close(wait=True) if close else rbt.tool.open(wait=True)
+    except (MotionError, TimeoutError) as exc:
+        print(f"Gripper command failed: {exc}")
+        return
+    if result < 0:
+        print(f"Controller rejected the gripper command (result {result}).")
+    else:
+        print(f"Gripper {'closed' if close else 'open'}.")
+
+
 def _solve_free_rx(
     pose: list[float], seed_q: np.ndarray
 ) -> tuple[float, np.ndarray] | None:
@@ -369,6 +384,7 @@ def main() -> None:
         print("  Space: stop    Esc: stop and quit")
         print("  P: print coordinates    C: append coordinates to CSV")
         print("  Y: find yellow blocks with the camera and append them to CSV")
+        print("  V: open gripper    B: close gripper")
         print("  [ / ]: slower / faster    - / =: lower / higher acceleration")
         print("  F: toggle translation frame (WRF / TRF)")
         rx_state = "on" if RX_FREE else "off"
@@ -425,6 +441,10 @@ def main() -> None:
                 _save_yellow(yellow_camera)
                 last_active_key = None
                 continue
+            if "v" in actions:
+                _set_gripper(rbt, close=False)
+            if "b" in actions:
+                _set_gripper(rbt, close=True)
             if "[" in actions:
                 JOG_SPEED = max(0.05, JOG_SPEED - 0.05)
                 print(f"Jog speed: {JOG_SPEED:.2f}")

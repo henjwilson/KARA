@@ -79,7 +79,10 @@ After calibrating, the map can be corrected using blocks measured both ways.
 In `programs/cartesian_keyboard.py`, for each block (spread them over the
 board): press **Y** (camera saves the block's top center as a `camera` row),
 then jog the TCP to the block's top center and press **C** (a `robot` row).
-Then run:
+Or let the robot place the block itself: `programs/drop_calibrate.py` visits
+a grid inside the markers with the block in the gripper, you lower it to the
+table with Q / E and press Enter, and it releases, homes, logs the camera and
+release positions, and picks the block back up for the next point. Then run:
 
 ```bash
 .venv/bin/python OpenCV/main.py --refine
@@ -134,13 +137,34 @@ python OpenCV/main.py --calibrate --camera 1 --dictionary 5X5_100
 python OpenCV/main.py --camera 1 --dictionary 5X5_100 --min-area 700 --confirm-frames 5
 ```
 
-## Hover the robot over yellow blocks
+## Pick up yellow blocks
 
 `seek_yellow.py` keeps watching for yellow blocks inside the ArUco border.
 When one has been seen steadily (`--confirm-frames`, default 10), the robot
-moves straight to its XY **30 mm above the table**, waits 2 seconds, homes, and
-looks for the next block. Blocks it already visited are drawn grey and skipped
-until they are removed; out-of-reach blocks are skipped too. Press **Q** to stop.
+picks it up and drops it at home, then looks for the next block. The target
+XY is the median over those frames, using only frames where the block's top
+face was found; a block whose top face shows in fewer than half of them is
+labelled "no top face, waiting" and isn't picked until it does. Blocks it
+already tried are drawn grey and skipped until they are removed; out-of-reach
+blocks are skipped too. Press **Q** to stop.
+
+It relies on the pairs `programs/drop_calibrate.py` logged with the current
+camera calibration (at least 6; it refuses to start without them):
+
+- **Position:** a smoothed thin-plate spline maps the camera's XY onto where
+  the robot actually released the block, which also absorbs the arm's own
+  positioning error. On start it prints the camera's average error before
+  and the error after, measured on pairs left out of the fit.
+- **Height:** the pick height is interpolated from the release heights, the
+  TCP heights at which the block sat on the table.
+- **Orientation:** planned as in `drop_calibrate.py` (`OpenCV/placement.py`):
+  Rx 90 with at least 45 deg of Ry freedom, Rx lowered only where needed.
+
+Don't run `main.py --refine` after collecting pairs: it changes the map, so
+the pairs no longer apply. Recalibrating means collecting them again.
+
+For each block the arm moves 50 mm above it, descends straight down, closes
+the gripper, lifts, homes, and opens the gripper to drop the block.
 
 It needs both `parol6` and OpenCV, so run it from the repo's `.venv` with
 `parol6-server` already running:
@@ -149,9 +173,3 @@ It needs both `parol6` and OpenCV, so run it from the repo's `.venv` with
 .venv/bin/python OpenCV/seek_yellow.py --camera 0
 .venv/bin/python OpenCV/seek_yellow.py --camera 0 --dry-run   # no robot motion
 ```
-
-The gripper is oriented like it was when the calibration markers were
-touched: Ry stays at 0, Rz is +90 on the +Y side and -90 on the -Y side, and
-only Rx tilts to reach the block. The robot stops `TARGET_HEIGHT_MM` (30 mm)
-above the table surface at the block, following the table's tilt. That, wait
-time, and speed are constants at the top of `seek_yellow.py`.
