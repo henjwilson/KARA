@@ -1,0 +1,4 @@
+# Install into the Python environment used for your PAROL6 scripts, or use --python
+# to point the voice service at the Python containing parol6/OpenCV.
+vosk>=0.3.45,<0.4
+sounddevice>=0.4.6,<1
