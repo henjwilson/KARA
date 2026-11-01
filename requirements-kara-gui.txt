@@ -1,0 +1,2 @@
+# Desktop Qt user interface only. PAROL6 and camera dependencies are separate.
+PySide6>=6.6,<7
