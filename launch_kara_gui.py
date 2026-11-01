@@ -1,5 +1,5 @@
-"""Launch the KARA desktop control panel for programs/ and OpenCV/."""
-from programs.KARA_Programs_GUI import main
+"""Start the KARA Qt dashboard from the project root."""
+from gui.main import main
 
 if __name__ == '__main__':
     raise SystemExit(main())
