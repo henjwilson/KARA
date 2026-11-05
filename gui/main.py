@@ -39,6 +39,7 @@ from gui.theme import (  # noqa: E402
     TEXT as COLOR_TEXT, WARNING as COLOR_AMBER, STYLESHEET,
 )
 from gui.camera_panel import CameraPanel  # noqa: E402
+from gui.voice_panel import DashboardRunner, VoicePanel  # noqa: E402
 
 
 def _label(text: str, *, obj: str | None = None, wrap: bool = False) -> QLabel:
@@ -212,6 +213,11 @@ class KaraProgramsGUI(QMainWindow):
         tip = _label('Choose a program to see the command output in real time.', obj='mutedText', wrap=True)
         lay.addWidget(tip)
         lay.addStretch(1)
+
+        # voice in the sidebar
+        self.voice_panel = VoicePanel(DashboardRunner(self), lambda: self.allow_motion.isChecked())
+        self.voice_panel.message.connect(self.log)
+        lay.addWidget(self.voice_panel)
 
         safety_note = QFrame()
         safety_note.setObjectName('sideInfo')
@@ -642,7 +648,7 @@ class KaraProgramsGUI(QMainWindow):
             self.log(f'Stopping {self.server_name}.')
 
     def _validate_job(self, *, needs_robot: bool, moves_robot: bool,
-                      description: str, caution: str = '') -> bool:
+                      description: str, caution: str = '', confirmed: bool = False) -> bool:
         if self.stop_pending:
             raise RuntimeError('Software stop in progress. Start another action after it finishes.')
         if self._busy(self.program_process):
@@ -653,13 +659,15 @@ class KaraProgramsGUI(QMainWindow):
         if moves_robot:
             if not self.allow_motion.isChecked():
                 raise RuntimeError('Robot motion is locked. Tick Enable real robot motion first.')
+            if confirmed:
+                return True
             warning = f'\n\nCAUTION: {caution}' if caution else ''
             return QMessageBox.question(
                 self, 'Confirm real robot movement',
                 f'{description}{warning}\n\nClear the work area and keep the hardware E-STOP accessible.\nRun now?',
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             ) == QMessageBox.Yes
-        if caution:
+        if caution and not confirmed:
             return QMessageBox.question(
                 self, 'Confirm calibration operation',
                 f'{description}\n\nCAUTION: {caution}\n\nContinue?',
@@ -667,12 +675,14 @@ class KaraProgramsGUI(QMainWindow):
             ) == QMessageBox.Yes
         return True
 
-    def start_program(self, key: str):
+    def start_program(self, key: str, *, voice: bool = False) -> bool:
+        # voice=True means they already said confirm so skip the popup
         spec = PROGRAM_BY_KEY[key]
         try:
             if not self._validate_job(needs_robot=spec.requires_robot,
-                moves_robot=spec.moves_robot, description=spec.description, caution=spec.caution):
-                return
+                moves_robot=spec.moves_robot, description=spec.description, caution=spec.caution,
+                confirmed=voice):
+                return False
             argv = program_command(key, self._python(), self.camera_spin.value() if spec.camera else 0)
             if spec.camera and self.camera_panel.has_session():
                 # Only one process may own a local USB camera at once.
@@ -692,10 +702,16 @@ class KaraProgramsGUI(QMainWindow):
         except (OSError, RuntimeError, ValueError) as exc:
             self.camera_panel.set_reserved(False)
             self._resume_preview_if_needed()
+            if voice:
+                self.log(str(exc), 'error')
+                raise
             self._error_dialog('Could not start program', exc)
-        self._update_button_states()
+            return False
+        finally:
+            self._update_button_states()
+        return True
 
-    def start_action(self, action: str):
+    def start_action(self, action: str, *, voice: bool = False) -> bool:
         names = {
             'home': 'Move robot HOME', 'park': 'Move robot to Commander.PARK_ANGLES',
             'gripper_open': 'Open pneumatic gripper', 'gripper_close': 'Close pneumatic gripper',
@@ -705,14 +721,20 @@ class KaraProgramsGUI(QMainWindow):
             if not self._validate_job(needs_robot=True, moves_robot=action != 'pose',
                 description=names[action],
                 caution='PARK angles come from Commander.py; verify the pose for your robot.'
-                if action == 'park' else ''):
-                return
+                if action == 'park' else '', confirmed=voice):
+                return False
             self.current_program_key = f'action:{action}'
             self.program_process = self._spawn(action_command(action, self._python()), name='program')
             self.script_state_label.setText(f'●  RUNNING · {names[action]}')
         except (OSError, RuntimeError, ValueError) as exc:
+            if voice:
+                self.log(str(exc), 'error')
+                raise
             self._error_dialog('Command rejected', exc)
-        self._update_button_states()
+            return False
+        finally:
+            self._update_button_states()
+        return True
 
     def send_command(self):
         proc = self.program_process
@@ -871,6 +893,7 @@ class KaraProgramsGUI(QMainWindow):
             return
         self.closing = True
         self.timer.stop()
+        self.voice_panel.shutdown()
         # Synchronously wait briefly to avoid QProcess destroyed-while-running errors
         # at application shutdown; software stop remains a separate robot command.
         for proc in (self.program_process, self.server_process):

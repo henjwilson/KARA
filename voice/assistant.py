@@ -6,11 +6,20 @@ from dataclasses import dataclass
 from typing import Callable
 
 from programs.kara_launcher_core import PROGRAM_BY_KEY
-from voice.commands import Intent, parse_command, strip_wake
+from voice.commands import ACTION_PHRASES, PROGRAM_PHRASES, Intent, parse_command, strip_wake
 from voice.runner import ProgramRunner
 
 
 MOTION_ACTIONS = {"home", "park", "gripper_open", "gripper_close"}
+
+
+def say_name(key: str) -> str:
+    # the words you actually say for a command, like "open gripper" not "gripper open"
+    key = key.removeprefix("action:")
+    for phrase, phrase_key in list(ACTION_PHRASES.items()) + list(PROGRAM_PHRASES.items()):
+        if phrase_key == key:
+            return phrase
+    return key.replace("_", " ")
 
 
 @dataclass
@@ -23,12 +32,16 @@ class Pending:
 class KaraAssistant:
     def __init__(self, runner: ProgramRunner, *, enable_motion: bool = False,
                  wake_seconds: float = 6.0, confirm_seconds: float = 8.0,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 motion_hint: str = "Restart with --enable-motion",
+                 require_wake: bool = True):
         self.runner = runner
         self.enable_motion = enable_motion
         self.wake_seconds = wake_seconds
         self.confirm_seconds = confirm_seconds
         self.clock = clock
+        self.motion_hint = motion_hint
+        self.require_wake = require_wake
         self.wake_until = 0.0
         self.pending: Pending | None = None
 
@@ -37,9 +50,11 @@ class KaraAssistant:
         if self.pending and now > self.pending.until:
             self.pending = None
         has_wake, phrase = strip_wake(utterance)
+        if not self.require_wake:
+            has_wake = True
         if has_wake and not phrase:
             self.wake_until = now + self.wake_seconds
-            return "Listening. Say a command within six seconds."
+            return "I'm listening. Say a command."
 
         # STOP is accepted with the wake phrase OR as a standalone instruction,
         # reducing delays when an operation needs to be interrupted.
@@ -48,7 +63,7 @@ class KaraAssistant:
             self.pending = None
             self.wake_until = 0.0
             self.runner.stop()
-            return "Software stop requested. Use the hardware E-STOP for an emergency."
+            return "Software stop requested. Use the hardware E-stop in an emergency."
 
         # Confirmation is allowed without wake phrase only while a command is armed.
         if intent and intent.kind == "confirm" and self.pending:
@@ -57,25 +72,29 @@ class KaraAssistant:
                 self.pending = None
                 self.wake_until = 0.0
                 return self._launch(pending.kind, pending.key)
-            return f"Confirmation did not match. Say 'confirm {pending.key.replace('_', ' ')}'."
+            return f"That did not match. Say confirm {say_name(pending.key)}."
 
         if not has_wake and now > self.wake_until:
             return ""  # Ignore background speech.
         if not intent:
+            if not self.require_wake:
+                return ""  # no wake word, so stay quiet on random talk
             return "Command not recognized; say 'Hey Kara, help' for examples."
         self.wake_until = 0.0
         if intent.kind == "cancel":
             self.pending = None
-            return "Pending command canceled."
+            return "Okay, canceled."
         if intent.kind == "help":
-            return ("Try: Hey Kara, seek yellow; seek yellow dry run; track yellow; "
-                    "home; open gripper; status; or stop. Motion requires confirmation.")
+            wake = "Hey Kara, " if self.require_wake else ""
+            return (f"You can say {wake}seek yellow, track yellow, home, park, open gripper, "
+                    "close gripper, status, or stop. Anything that moves the robot needs a confirm.")
         if intent.kind == "status":
-            name = self.runner.active_name if self.runner.running() else "nothing"
-            mode = "motion enabled" if self.enable_motion else "motion disabled"
-            return f"Running: {name}. {mode}."
+            running = (f"{say_name(self.runner.active_name)} is running." if self.runner.running()
+                       else "Nothing is running.")
+            mode = "Motion is enabled." if self.enable_motion else "Motion is currently disabled."
+            return f"{running} {mode}"
         if intent.kind == "confirm":
-            return "No action is waiting for confirmation."
+            return "Nothing is waiting for a confirm."
         if intent.kind in ("program", "action"):
             return self._request(intent, now)
         return "Command not recognized."
@@ -87,19 +106,19 @@ class KaraAssistant:
                 if not self.enable_motion:
                     if intent.key == "seek_yellow":
                         if self.runner.start_program("seek_yellow_dry"):
-                            return "Robot motion disabled. Starting yellow detection DRY RUN."
+                            return "Robot motion is off, so I'm starting the yellow detection DRY RUN."
                         return "Another program is running."
-                    return "Motion disabled. Restart with --enable-motion to run this routine."
+                    return f"Motion disabled. {self.motion_hint} to run this routine."
                 self.pending = Pending("program", intent.key, now + self.confirm_seconds)
-                return f"Motion requested: {spec.title}. Say 'confirm seek yellow' within eight seconds."
+                return self._ask_confirm(intent.key)
             if self.runner.start_program(intent.key):
-                return f"Started {spec.title}."
+                return f"Starting {say_name(intent.key)}."
             return "Another program is running."
         if intent.key in MOTION_ACTIONS:
             if not self.enable_motion:
-                return "Motion disabled. Restart with --enable-motion to control the robot."
+                return f"Motion disabled. {self.motion_hint} to control the robot."
             self.pending = Pending("action", intent.key, now + self.confirm_seconds)
-            return f"Robot action: {intent.key.replace('_', ' ')}. Say 'confirm {intent.key.replace('_', ' ')}' within eight seconds."
+            return self._ask_confirm(intent.key)
         return self._launch(intent.kind, intent.key)
 
     def _launch(self, kind: str, key: str) -> str:
@@ -109,4 +128,8 @@ class KaraAssistant:
             okay = self.runner.start_action(key)
         else:
             return "Unknown action."
-        return f"Starting {key.replace('_', ' ')}." if okay else "Another program is running."
+        return f"Starting {say_name(key)}." if okay else "Another program is running."
+
+    def _ask_confirm(self, key: str) -> str:
+        name = say_name(key)
+        return f"Please say confirm {name}."
