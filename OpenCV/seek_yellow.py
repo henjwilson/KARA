@@ -1,4 +1,4 @@
-"""Watch the table for yellow blocks; pick each one up and drop it at home.
+"""Watch the table for red blocks; pick each one up and drop it beside the arm.
 
 Setup:
     Run `parol6-server` in a separate terminal FIRST, then run this script
@@ -8,12 +8,13 @@ Setup:
 
         .venv/bin/python OpenCV/seek_yellow.py --camera 0
 
-Each cycle: wait for a confirmed yellow block inside the ArUco border, turn
+Each cycle: wait for a confirmed SEEK_COLOR block inside the ArUco border, turn
 its camera position into robot XY with the drop-calibrate correction, and
-plan a gripper orientation the same way drop_calibrate.py does. The arm
-moves SAFE_HEIGHT_MM above the block, descends straight down to the TCP
-height the drop-calibrate releases had there, grips, lifts, homes, and opens
-the gripper to drop the block. Press Q in the camera window to stop.
+plan a gripper orientation that lines the jaws up with the block's sides. The
+arm moves SAFE_HEIGHT_MM above the block, descends straight down to the TCP
+height the drop-calibrate releases had there, grips, lifts, moves to
+DROP_POSE, opens the gripper to drop the block, and homes. Press Q in the
+camera window to stop.
 """
 
 from __future__ import annotations
@@ -54,10 +55,13 @@ from placement import (
     GripperError,
     Plan,
     load_drop_correction,
-    plan_point,
+    plan_seek_pick,
     set_gripper,
 )
-from util import detect_colored_blocks
+from cube_pose import CubeCamera
+from reach_map import border_extension, work_border
+from table_fit import project
+from util import block_yaw, detect_colored_blocks
 
 # Matches drop_calibrate.py's default, so picks use the orientations its
 # placements were checked with.
@@ -65,6 +69,11 @@ SAFE_HEIGHT_MM = 50.0
 MOVE_SPEED = 0.3
 # Near the table, and while carrying the block, move slowly.
 SLOW_SPEED = 0.1
+# Let the arm stop swaying before the jaws close on the block.
+GRIP_SETTLE_S = 1.5
+SEEK_COLOR = "red"
+# Where picked blocks are let go, WRF mm and deg: beside the base, opposite home.
+DROP_POSE = [8.32, -196.84, 279.01, -88.92, -20.68, -88.31]
 # A block within this distance of one already visited is the same block.
 VISITED_RADIUS_MM = 25.0
 # A visited spot empty for this many frames is forgotten, so a new block
@@ -84,9 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-fill", type=float, default=0.6)
     parser.add_argument("--confirm-frames", type=int, default=10,
                         help="Frames a block must be seen before the robot goes to it")
-    parser.add_argument("--drop-pairs", type=int, default=23,
-                        help="Use only the most recent N drop-calibrate pairs "
-                             "(one full drop_calibrate run is 23)")
+    parser.add_argument("--drop-pairs", type=int, default=None,
+                        help="Use only the most recent N drop-calibrate pairs (default: all)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Detect and plan, but do not move the robot")
     add_calibration_args(parser)
@@ -96,7 +104,7 @@ def parse_args() -> argparse.Namespace:
 def pick_and_drop(rbt: RobotClient | None, x: float, y: float, z: float,
                   plan: Plan) -> None:
     """Pick the block at (x, y) with the TCP at height z, then drop it at home."""
-    print(f"Picking yellow at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
+    print(f"Picking {SEEK_COLOR} at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
     if rbt is None:
         time.sleep(1.0)
         return
@@ -107,11 +115,13 @@ def pick_and_drop(rbt: RobotClient | None, x: float, y: float, z: float,
         if above is None:
             raise TimeoutError("pose unavailable above the block")
         rbt.move_l([x, y, z, *above[3:]], speed=SLOW_SPEED, wait=True, timeout=30.0)
+        time.sleep(GRIP_SETTLE_S)
         set_gripper(rbt, close=True)
         rbt.move_l(above, speed=SLOW_SPEED, wait=True, timeout=30.0)
-        rbt.home(wait=True)
+        rbt.move_j(pose=DROP_POSE, speed=MOVE_SPEED, wait=True, timeout=30.0)
         set_gripper(rbt, close=False)
-        print("Dropped at home. Looking for another yellow block...")
+        rbt.home(wait=True)
+        print(f"Dropped. Looking for another {SEEK_COLOR} block...")
     except (MotionError, TimeoutError, GripperError) as exc:
         print(f"Pick failed ({exc}); returning home.")
         try:
@@ -163,24 +173,30 @@ def main() -> None:
         set_gripper(rbt, close=False)
     homography = calibration["pixel_to_robot_xy"]
 
-    def to_robot(pixel_xy: tuple[float, float]) -> tuple[float, float]:
-        return correction.to_robot(map_xy(pixel_xy, homography))
+    def to_robot(pixel_xy: tuple[float, float], height: float = 0.0) -> tuple[float, float]:
+        return correction.to_robot(map_xy(pixel_xy, homography), height)
 
-    border = cv2.convexHull(np.asarray(
+    def to_table(pixels: np.ndarray) -> np.ndarray:
+        return correction.to_robot_points(project(homography, pixels))
+
+    cube_camera = CubeCamera(homography, (frame.shape[1], frame.shape[0]))
+    extension = border_extension(calibration)
+    border = work_border(cv2.convexHull(np.asarray(
         [m["image_xy"] for m in calibration["markers"]], dtype=np.float32
-    ))
-    tracker = BlockTracker(args.confirm_frames)
+    )), extension)
+    tracker = BlockTracker(args.confirm_frames,
+                           yaw_of=lambda block: block_yaw(block, to_table))
     visited: dict[tuple[float, float], int] = {}  # spot -> frames since last seen
     unreachable: list[tuple[float, float]] = []
     robot_job: threading.Thread | None = None
     shift_warned = False
-    print("Looking for yellow blocks. Press Q in the camera window to quit.")
+    print(f"Looking for {SEEK_COLOR} blocks. Press Q in the camera window to quit.")
 
     try:
         while True:
             detections = detect_markers(frame, detector)
             shift_warned = check_camera_shift(detections, calibration, shift_warned)
-            border = aruco_border(detections, border)
+            border = work_border(aruco_border(detections, border), extension)
             busy = robot_job is not None and robot_job.is_alive()
             # The arm passes through the view while moving; restart
             # confirmation once it is home so its motion can't trigger a visit.
@@ -189,6 +205,7 @@ def main() -> None:
             raw = [] if busy else detect_colored_blocks(
                 frame, min_area=args.min_area, border=border,
                 border_margin=args.border_margin, min_fill=args.min_fill,
+                camera=cube_camera, colors=(SEEK_COLOR,),
             )
             blocks = tracker.update(raw)
             if not busy:
@@ -207,7 +224,8 @@ def main() -> None:
             target = None
             for block in blocks:
                 steady = block["steady_contact_xy"]
-                x, y = to_robot(steady or block["contact_xy"])
+                height = block["height_mm"]
+                x, y = to_robot(steady or block["contact_xy"], height)
                 done = any(math.dist((x, y), p) <= VISITED_RADIUS_MM
                            for p in [*visited, *unreachable])
                 if block["top_found"]:
@@ -225,24 +243,26 @@ def main() -> None:
                 mode = "top" if steady else "no top face, waiting"
                 cv2.putText(view, f"({mode}) X{x:.0f} Y{y:.0f}", (left, max(20, top - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-                if steady and not done and target is None:
-                    target = (x, y)
+                if steady and block["yaw_ready"] and not done and target is None:
+                    target = (x, y, block["steady_yaw"], height)
             status = "ROBOT MOVING" if busy else "SEARCHING"
             cv2.putText(view, f"{status} | visited {len(visited)}", (18, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.imshow("Seek yellow", view)
+            cv2.imshow(f"Seek {SEEK_COLOR}", view)
 
             if target is not None:
-                x, y = target
-                z = correction.pick_z(x, y)
-                plan = plan_point(x, y, z, SAFE_HEIGHT_MM)
-                if plan is None:
-                    print(f"Yellow at X={x:.1f} Y={y:.1f} is out of reach; skipping.")
-                    unreachable.append(target)
+                x, y, yaw, height = target
+                z = correction.pick_z(x, y, height)
+                planned = plan_seek_pick(correction, x, y, z, SAFE_HEIGHT_MM, yaw)
+                if planned is None:
+                    print(f"Block at X={x:.1f} Y={y:.1f} can't be gripped at "
+                          f"{yaw:.0f} deg from here; skipping.")
+                    unreachable.append((x, y))
                 else:
-                    visited[target] = 0
+                    visited[(x, y)] = 0
                     robot_job = threading.Thread(
-                        target=pick_and_drop, args=(rbt, x, y, z, plan), daemon=True
+                        target=pick_and_drop, args=(rbt, planned[0], planned[1], z, planned[2]),
+                        daemon=True,
                     )
                     robot_job.start()
 

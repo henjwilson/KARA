@@ -80,9 +80,12 @@ In `programs/cartesian_keyboard.py`, for each block (spread them over the
 board): press **Y** (camera saves the block's top center as a `camera` row),
 then jog the TCP to the block's top center and press **C** (a `robot` row).
 Or let the robot place the block itself: `programs/drop_calibrate.py` visits
-a grid inside the markers with the block in the gripper, you lower it to the
-table with Q / E and press Enter, and it releases, homes, logs the camera and
-release positions, and picks the block back up for the next point. Then run:
+30 points, 20 in the green area sweeping a 90 deg range of gripper angles and
+10 outside it using whatever angles each can reach, with the block in the
+gripper. You hold Q / E to lower it to the table and J / L, I / K or U / O to
+turn the gripper, [ / ] set the speed, and Enter releases. It then homes, logs the camera and release positions with the angle
+measured, and picks the block back up for the next point. Running it again
+tests 30 new points, and a run you quit carries on where it stopped. Then run:
 
 ```bash
 .venv/bin/python OpenCV/main.py --refine
@@ -113,7 +116,18 @@ of their rectangle are ignored as non-rectangular.
 To suppress noise, regions smaller than `--min-area` (default 400 px) are
 ignored, and a block is only reported once it has been seen in
 `--confirm-frames` (default 3) consecutive frames at about the same spot.
-The camera overlay shows the number of detected yellow regions.
+The camera overlay shows the number of detected blocks. Red, yellow, green and
+blue are all found, each with its angle on the table, and touching blocks are
+split apart. Picking and `drop_calibrate.py` still use yellow only.
+
+Each block is a 3D cube fitted to its outline (`OpenCV/cube_pose.py`), giving
+position, angle and stack level at once. Lens distortion is about 1 px at the
+image edges and isn't modeled. `FOCAL_PX` and `CUBE_SIDE_MM` in that file are
+measured values; change `CUBE_SIDE_MM` for other blocks.
+
+The blue box runs from the markers out to the far edge of the area in
+`reach_map.py`, so blocks past the markers are found too. `drop_calibrate.py`
+stays inside the markers, so picks beyond them use an extrapolated correction.
 Press **P** to print current XYZ coordinates in the terminal; **Z** is
 estimated from the calibrated table-height plane. Press **Q** to quit.
 
@@ -157,11 +171,24 @@ camera calibration (at least 6; it refuses to start without them):
   and the error after, measured on pairs left out of the fit.
 - **Height:** the pick height is interpolated from the release heights, the
   TCP heights at which the block sat on the table.
-- **Orientation:** planned as in `drop_calibrate.py` (`OpenCV/placement.py`):
-  Rx 90 with at least 45 deg of Ry freedom, Rx lowered only where needed.
+- **Orientation:** the jaws turn to match the block's sides, read from the
+  camera (`plan_pick` in `OpenCV/placement.py`). The gripper stays vertical
+  where it can and tilts only as needed; a block that can't be reached at its
+  angle is skipped.
 
-Don't run `main.py --refine` after collecting pairs: it changes the map, so
-the pairs no longer apply. Recalibrating means collecting them again.
+Stacking heights get their own pairs: `programs/drop_calibrate.py --level 1`
+releases the block on one cube, which you place under the gripper at each
+point. Two pairs correct height as a whole; eight also correct how that varies
+across the table. Heights between are interpolated.
+
+Pairs survive a recalibration, so there's no need to collect them again when
+the camera moves. Each calibration stores the pairs with where its map put the
+four marker spots, and later maps are lined up with it through those spots
+(`OpenCV/drop_pairs.py`). This relies on the markers staying put on the table:
+if they have moved more than 5 mm relative to each other, the pairs are skipped
+with a warning, and apply again once the markers are back and you recalibrate.
+If you move the markers for good, update `MARKER_ROBOT_COORDS_MM` and collect
+new pairs.
 
 For each block the arm moves 50 mm above it, descends straight down, closes
 the gripper, lifts, homes, and opens the gripper to drop the block.

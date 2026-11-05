@@ -7,12 +7,10 @@ so both reach the table with the same gripper orientations.
 
 from __future__ import annotations
 
-import csv
 import json
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +18,10 @@ import numpy as np
 import parol6.PAROL6_ROBOT as PAROL6_ROBOT
 from parol6 import RobotClient
 from parol6.utils.ik import solve_ik
-from pinokin import so3_rpy
+from pinokin import se3_from_rpy, so3_rpy
+
+from cube_pose import CUBE_SIDE_MM
+from drop_pairs import carried_pairs, current_pairs
 
 HOST, PORT = "127.0.0.1", 5001
 TOOL, TOOL_VARIANT = "PNEUMATIC", "vertical"
@@ -52,6 +53,15 @@ MAX_JOINT_STEP_RAD = math.radians(10.0)
 
 # The correction needs at least this many drop-calibrate pairs.
 MIN_DROP_PAIRS = 6
+MIN_HEIGHT_PAIRS = 2
+# Heading-aware correction: pairs needed, smoothing of the map under it, and how
+# near (mm, deg) a drop must be to count, chosen by leaving drops out of the fit.
+MIN_HEADING_PAIRS = 12
+HEADING_BASE_SMOOTHING = 1.0
+HEADING_NEAR_MM = 100.0
+HEADING_NEAR_DEG = 20.0
+HEADING_SHRINK = 0.3
+MIN_HEIGHT_TILT_PAIRS = 8
 # Thin-plate spline smoothing (normalized units) tried by leave-one-out; the
 # largest is effectively a plain affine fit.
 SMOOTHING_CHOICES = (0.0, 0.001, 0.01, 0.1, 1.0, 1e6)
@@ -94,8 +104,9 @@ class Plan:
         so3_rpy(self.rotation, rpy)
         rx, ry, rz = np.degrees(rpy)
         low, high = self.ry_range
-        return (f"Rx={rx:6.1f} Ry={ry:6.1f} Rz={rz:6.1f}  (Ry free over "
-                f"{high - low:.0f} deg, Rx lowered {self.rx_decrease} from 90)")
+        freedom = f"Ry free over {high - low:.0f} deg" if high > low else "Ry set by the block"
+        return (f"Rx={rx:6.1f} Ry={ry:6.1f} Rz={rz:6.1f}  ({freedom}, "
+                f"Rx lowered {self.rx_decrease} from 90)")
 
 
 def _ik_seeds(x: float, y: float) -> list[np.ndarray]:
@@ -173,6 +184,120 @@ def plan_point(x: float, y: float, table: float, safe_height: float) -> Plan | N
     return None
 
 
+def heading_window(x: float, y: float, table: float, safe_height: float,
+                   tilt: int = 0) -> tuple[float, float]:
+    """Widest continuous range of headings reaching the table at this tilt: its
+    lowest heading and its width in degrees. Width -1 means none reach."""
+    top, bottom = table + safe_height, table - BELOW_TABLE_MM
+    headings = list(range(-180, 180, HEADING_STEP_DEG))
+    ok = [_descent_start(x, y, top, bottom, _orientation(tilt, h)) is not None for h in headings]
+    if all(ok):
+        return -180.0, 360.0
+    if not any(ok):
+        return 0.0, -1.0
+    gap = ok.index(False)
+    run = longest = longest_end = 0
+    for i in range(gap + 1, gap + 1 + len(ok)):
+        run = run + 1 if ok[i % len(ok)] else 0
+        if run > longest:
+            longest, longest_end = run, i
+    low = headings[0] + (longest_end - longest + 1) * HEADING_STEP_DEG
+    return float(low), float((longest - 1) * HEADING_STEP_DEG)
+
+
+def vertical_yaw_range(x: float, y: float, table: float, safe_height: float) -> float:
+    """Widest continuous yaw range (deg) reaching the table with the gripper vertical."""
+    return max(0.0, heading_window(x, y, table, safe_height)[1])
+
+
+def lifts_straight_up(angles: list[float], pose: list[float], top_z: float) -> bool:
+    """True if the arm, at joint ``angles`` (deg) and WRF ``pose``, can rise to
+    ``top_z`` (mm) without changing orientation."""
+    target = np.zeros((4, 4))
+    x, y = pose[0] / 1000.0, pose[1] / 1000.0
+    q = np.radians(angles)
+    for z in np.arange(pose[2] + DESCENT_STEP_MM, top_z + 1e-6, DESCENT_STEP_MM):
+        se3_from_rpy(x, y, z / 1000.0, *np.radians(pose[3:]), target)
+        result = solve_ik(PAROL6_ROBOT.robot, target, q, quiet_logging=True)
+        if not result.success or np.abs(result.q - q).max() > MAX_JOINT_STEP_RAD:
+            return False
+        q = result.q.copy()
+    return True
+
+
+def plan_heading(x: float, y: float, table: float, safe_height: float, heading: float,
+                 tilt: int = 0) -> Plan | None:
+    """Orientation at exactly this heading, or None if it doesn't reach the table."""
+    heading = (heading + 180.0) % 360.0 - 180.0
+    rotation = _orientation(tilt, heading)
+    start = _descent_start(x, y, table + safe_height, table - BELOW_TABLE_MM, rotation)
+    if start is None:
+        return None
+    return Plan(np.degrees(start).tolist(), rotation, tilt, (heading, heading))
+
+
+def plan_pick(x: float, y: float, table: float, safe_height: float, yaw: float,
+              max_tilt: int = MAX_RX_DECREASE_DEG, prefer: float = 0.0) -> Plan | None:
+    """Orientation that lines the jaws up with a block turned ``yaw`` degrees.
+
+    The jaws close along a tool axis that lies along a world axis at heading 0,
+    and either world axis grips a square block, so any heading of ``yaw`` plus
+    a multiple of 90 will do. Uses the least tilt that reaches the table, up to
+    ``max_tilt``, then the heading nearest ``prefer``. Returns None if no such
+    heading can, rather than gripping the block across its corners.
+    """
+    top, bottom = table + safe_height, table - BELOW_TABLE_MM
+    headings = sorted(((yaw + 90 * k + 180) % 360 - 180 for k in range(4)),
+                      key=lambda h: abs((h - prefer + 180) % 360 - 180))
+    for rx_decrease in range(0, max_tilt + 1, RX_STEP_DEG):
+        for heading in headings:
+            rotation = _orientation(rx_decrease, heading)
+            start = _descent_start(x, y, top, bottom, rotation)
+            if start is not None:
+                return Plan(np.degrees(start).tolist(), rotation, rx_decrease,
+                            (heading, heading))
+    return None
+
+
+def _height_design(xy: np.ndarray, count: int) -> np.ndarray:
+    """Terms of the height correction: a tilt over the table once there are
+    enough pairs to fit one, otherwise a single value everywhere."""
+    if count < MIN_HEIGHT_TILT_PAIRS:
+        return np.ones((len(xy), 1))
+    return np.column_stack((np.ones(len(xy)), xy))
+
+
+def _heading(rpy_deg: list[float]) -> float:
+    """Heading (the plan's Ry) of a gripper orientation read out as Rx, Ry, Rz."""
+    pose = np.zeros((4, 4))
+    se3_from_rpy(0.0, 0.0, 0.0, *np.radians(rpy_deg), pose)
+    turned = pose[:3, :3] @ TOUCH_ROTATION.T
+    return float(np.degrees(np.arctan2(turned[1, 0], turned[0, 0])))
+
+
+def _local_shift(drop_xy: np.ndarray, headings: np.ndarray, residuals: np.ndarray,
+                 xy: tuple[float, float], heading: float) -> np.ndarray:
+    """Weighted average of nearby drops' residuals, by distance and heading,
+    shrunk towards zero where there are few."""
+    distance = np.linalg.norm(drop_xy - xy, axis=1)
+    turn = np.abs((headings - heading + 180.0) % 360.0 - 180.0)
+    weights = np.exp(-(distance / HEADING_NEAR_MM) ** 2 - (turn / HEADING_NEAR_DEG) ** 2)
+    return (weights[:, None] * residuals).sum(axis=0) / (weights.sum() + HEADING_SHRINK)
+
+
+def _heading_leave_one_out(camera_xy: np.ndarray, drop_xy: np.ndarray,
+                           headings: np.ndarray) -> float:
+    errors = []
+    for i in range(len(camera_xy)):
+        keep = np.arange(len(camera_xy)) != i
+        fit = _ThinPlate(camera_xy[keep], drop_xy[keep], HEADING_BASE_SMOOTHING)
+        residuals = drop_xy[keep] - fit(camera_xy[keep])
+        guess = fit(camera_xy[i])[0]
+        guess = guess + _local_shift(drop_xy[keep], headings[keep], residuals, guess, headings[i])
+        errors.append(float(np.linalg.norm(guess - drop_xy[i])))
+    return float(np.mean(errors))
+
+
 def _tps_kernel(sq_dist: np.ndarray) -> np.ndarray:
     # r^2 log r, written in terms of r^2; 0 at r = 0.
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -219,64 +344,136 @@ def _fit_by_leave_one_out(src: np.ndarray, values: np.ndarray) -> tuple[_ThinPla
 
 
 class DropCorrection:
-    """Camera XY -> robot XY and table pick height, from drop-calibrate pairs.
+    """Camera XY -> robot XY and pick height, from drop-calibrate pairs.
 
     Each pair is where the robot released the block (its TCP pose with the
-    block resting on the table) and where the camera then measured it.
+    block resting on the table) and where the camera then measured it, so
+    camera map error and arm positioning error are both absorbed here.
+
+    The arm's error also changes with the gripper's heading, differently across
+    the table. Given release orientations, a smooth map over the table is
+    corrected near each pick by the drops nearby made at a similar heading
+    (``heading_shift``), so a spot dropped at several headings is learned at
+    each of them.
+
+    Pairs taken on top of other cubes measure how the arm's error changes with
+    height. That change is smooth, so it is one term linear in height, fitted
+    over the table, on top of the table correction, and it interpolates between
+    heights. Without such pairs height just adds to Z.
     """
 
-    def __init__(self, camera_xy: np.ndarray, release_xyz: np.ndarray):
-        self.pair_count = len(camera_xy)
+    def __init__(self, camera_xy: np.ndarray, release_xyz: np.ndarray,
+                 levels: np.ndarray | None = None, side_mm: float = CUBE_SIDE_MM,
+                 release_rpy: list | None = None):
+        levels = np.zeros(len(camera_xy), dtype=int) if levels is None else np.asarray(levels)
+        on_table = levels == 0
+        table_camera, table_release = camera_xy[on_table], release_xyz[on_table]
+        self.pair_count = len(table_camera)
+        self.height_pair_count = len(camera_xy) - self.pair_count
         self.error_before_mm = float(
-            np.linalg.norm(camera_xy - release_xyz[:, :2], axis=1).mean())
-        self._xy, self.xy_error_mm = _fit_by_leave_one_out(camera_xy, release_xyz[:, :2])
+            np.linalg.norm(table_camera - table_release[:, :2], axis=1).mean())
+        table_rpy = [rpy for rpy, flat in zip(release_rpy or [None] * len(on_table), on_table)
+                     if flat]
+        self._headings = np.zeros(0)
+        if len(table_rpy) >= MIN_HEADING_PAIRS and all(rpy is not None for rpy in table_rpy):
+            self._headings = np.array([_heading(rpy) for rpy in table_rpy])
+            self._drop_xy = table_release[:, :2]
+            self._xy = _ThinPlate(table_camera, self._drop_xy, HEADING_BASE_SMOOTHING)
+            self._residuals = self._drop_xy - self._xy(table_camera)
+            self.xy_error_mm = _heading_leave_one_out(table_camera, self._drop_xy, self._headings)
+        else:
+            self._xy, self.xy_error_mm = _fit_by_leave_one_out(table_camera,
+                                                               table_release[:, :2])
         self._z, self.z_error_mm = _fit_by_leave_one_out(
-            release_xyz[:, :2], release_xyz[:, 2:3])
+            table_release[:, :2], table_release[:, 2:3])
+        self._per_mm = np.zeros((3, 3))
+        if self.height_pair_count >= MIN_HEIGHT_PAIRS:
+            raised = ~on_table
+            heights = (levels[raised] * side_mm)[:, None]
+            at_table = np.hstack((self._xy(camera_xy[raised]),
+                                  self._z(release_xyz[raised, :2]) + heights))
+            design = _height_design(camera_xy[raised], self.height_pair_count)
+            self._per_mm[:, :design.shape[1]] = np.linalg.lstsq(
+                design, (release_xyz[raised] - at_table) / heights, rcond=None)[0].T
 
-    def to_robot(self, camera_xy: tuple[float, float]) -> tuple[float, float]:
-        x, y = self._xy(np.asarray(camera_xy, dtype=float))[0]
+    def _height_term(self, xy: np.ndarray, height: float) -> np.ndarray:
+        return height * (self._per_mm @ np.array([1.0, *xy]))
+
+    def to_robot(self, camera_xy: tuple[float, float],
+                 height: float = 0.0) -> tuple[float, float]:
+        xy = self._xy(np.asarray(camera_xy, dtype=float))[0]
+        x, y, _ = self._height_term(xy, height) + (*xy, 0.0)
         return float(x), float(y)
 
-    def pick_z(self, x: float, y: float) -> float:
-        """TCP height that held the block resting on the table at (x, y)."""
-        return float(self._z(np.array([x, y]))[0, 0])
+    def to_robot_points(self, camera_xy: np.ndarray) -> np.ndarray:
+        return self._xy(camera_xy)
+
+    def heading_shift(self, x: float, y: float, heading: float) -> np.ndarray:
+        """Correction to ``to_robot``'s (x, y) for a pick at ``heading``: what the
+        drops nearby at a similar heading were off by. Zero without headings."""
+        if not len(self._headings):
+            return np.zeros(2)
+        return _local_shift(self._drop_xy, self._headings, self._residuals, (x, y), heading)
+
+    def pick_z(self, x: float, y: float, height: float = 0.0) -> float:
+        """TCP height that held a block resting ``height`` above the table at (x, y)."""
+        table = float(self._z(np.array([x, y]))[0, 0])
+        return table + height + float(self._height_term(np.array([x, y]), height)[2])
 
     def summary(self) -> str:
         return (f"Drop-calibrate correction from {self.pair_count} pairs: camera was "
                 f"off by {self.error_before_mm:.1f} mm on average; corrected, "
                 f"{self.xy_error_mm:.1f} mm on pairs left out of the fit. Pick "
-                f"height predicted to {self.z_error_mm:.1f} mm.")
+                f"height predicted to {self.z_error_mm:.1f} mm; "
+                f"{self.height_pair_count} pairs above table height"
+                f"{'; heading-aware' if len(self._headings) else ''}.")
 
 
 def load_drop_correction(calibration_path: Path, coords_csv: Path,
                          last: int | None = None) -> DropCorrection:
-    """Fit the correction from drop-calibrate rows taken with the current map,
-    only the most recent ``last`` pairs if given.
-
-    drop_calibrate.py writes each pair as a ``robot`` row followed by a
-    ``camera`` row with the same timestamp, which is how its pairs are told
-    apart from rows saved by hand.
-    """
+    """Fit the correction from the stored pairs, carried into the current map,
+    and the pairs taken with it; only the most recent ``last`` if given."""
     data = json.loads(calibration_path.read_text(encoding="utf-8"))
-    since = datetime.fromisoformat(data.get("updated_utc", data["created_utc"]))
-    rows = []
-    if coords_csv.exists():
-        with coords_csv.open(newline="", encoding="utf-8") as coords_file:
-            rows = [r for r in csv.DictReader(coords_file) if r.get("timestamp")]
-    camera, release = [], []
-    for robot_row, camera_row in zip(rows, rows[1:]):
-        if (robot_row.get("source") == "robot" and camera_row.get("source") == "camera"
-                and robot_row["timestamp"] == camera_row["timestamp"]
-                and datetime.fromisoformat(robot_row["timestamp"]) >= since):
-            camera.append([float(camera_row["x_mm"]), float(camera_row["y_mm"])])
-            release.append([float(robot_row[k]) for k in ("x_mm", "y_mm", "z_mm")])
+    camera, release, levels, orientations = carried_pairs(data)
+    for pair in current_pairs(data, coords_csv):
+        camera.append(pair["camera_xy_mm"])
+        release.append(pair["release_xyz_mm"])
+        levels.append(pair["level"])
+        orientations.append(pair["release_rpy_deg"])
+    camera, release, levels = np.asarray(camera), np.asarray(release), np.asarray(levels, dtype=int)
+    table = np.flatnonzero(levels == 0)
     if last is not None:
-        camera, release = camera[-last:], release[-last:]
-    if len(camera) < MIN_DROP_PAIRS:
+        table = table[-last:]
+    keep = np.concatenate((table, np.flatnonzero(levels > 0)))
+    camera, release, levels = camera[keep], release[keep], levels[keep]
+    orientations = [orientations[i] for i in keep]
+    if len(table) < MIN_DROP_PAIRS:
         raise SystemExit(
-            f"Found {len(camera)} drop-calibrate pair(s) taken with the current "
+            f"Found {len(table)} drop-calibrate pair(s) usable with the current "
             f"camera calibration; need at least {MIN_DROP_PAIRS}. Run "
-            "programs/drop_calibrate.py first (and don't run main.py --refine "
-            "afterwards: that changes the map and retires the pairs)."
+            "programs/drop_calibrate.py first."
         )
-    return DropCorrection(np.asarray(camera), np.asarray(release))
+    return DropCorrection(camera, release, levels, release_rpy=orientations)
+
+
+def preferred_heading(x: float, y: float, table: float, safe_height: float) -> float:
+    """The middle of the headings that reach (x, y) vertically: the one that
+    picks and drop calibrate turn the gripper around there."""
+    low, width = heading_window(x, y, table, safe_height)
+    return 0.0 if width >= 360.0 or width < 0 else low + width / 2.0
+
+
+def plan_seek_pick(correction: DropCorrection, x: float, y: float, z: float,
+                   safe_height: float, yaw: float) -> tuple[float, float, Plan] | None:
+    """Plan a pick of the block that ``to_robot`` put at (x, y): the TCP XY and
+    the plan, or None if it can't be gripped at its angle from there."""
+    plan = plan_pick(x, y, z, safe_height, yaw,
+                     prefer=preferred_heading(x, y, z, safe_height))
+    if plan is None:
+        return None
+    heading = plan.ry_range[0]
+    dx, dy = correction.heading_shift(x, y, heading)
+    if abs(dx) < 0.05 and abs(dy) < 0.05:
+        return x, y, plan
+    shifted = plan_heading(x + dx, y + dy, z, safe_height, heading, plan.rx_decrease)
+    return None if shifted is None else (x + dx, y + dy, shifted)

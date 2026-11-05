@@ -13,8 +13,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from drop_pairs import archive_pairs, carried_pairs
+from reach_map import border_extension, work_border
 from table_fit import PAIRING_MARGIN, fit_similarity, fit_table, is_mirrored, project
-from util import detect_colored_blocks
+from cube_pose import CUBE_SIDE_MM, CubeCamera
+from util import BLOCK_COLORS, block_yaw, detect_colored_blocks, robust_yaw
 
 
 DEFAULT_CALIBRATION = Path(__file__).with_name("table_calibration.json")
@@ -26,18 +29,23 @@ DICTIONARIES = ("4X4_50", "4X4_100", "5X5_100", "6X6_250", "7X7_1000")
 MAP_SIZE = (900, 700)
 MAP_MARGIN = 55
 CALIBRATION_FRAMES = 15
+# Before a block is picked its angle must hold within this (deg), over at least
+# this share of the frames.
+YAW_STABLE_DEG = 2.5
+YAW_MIN_AGREEMENT = 0.6
 # Warn when a calibration marker has moved this far in the image.
 CAMERA_SHIFT_WARN_PX = 15.0
 
 # Robot WRF millimeters of each marker's center, touched with the
 # PNEUMATIC/vertical gripper's TCP held just above the marker. Seen from the
-# camera: ID 8 top-left, 11 top-right, 5 bottom-right, 2 bottom-left (so
-# image-up is robot -Y and image-right is robot -X).
+# camera: ID 5 top-left, 8 top-right, 2 bottom-right, 11 bottom-left (so
+# image-right is robot +Y and image-down is robot +X, with the base at the
+# top center).
 MARKER_ROBOT_COORDS_MM = {
-    2: (299.5026823564, 199.6258653900, -2.1627053417),
-    5: (182.9104654491, 202.1685145635, -11.7663270022),
-    8: (321.6584876099, -254.5970431422, 7.1079269738),
-    11: (215.2683896891, -261.5579851145, -8.8318130756),
+    2: (278.16, 294.59, 9.22),
+    5: (144.35, -284.59, -5.13),
+    8: (127.36, 290.78, -4.22),
+    11: (299.92, -280.90, 8.87),
 }
 # How far above the table surface the TCP was when touching the markers; the
 # fitted table plane is this much below the touched points.
@@ -61,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--min-area", type=float, default=400,
-        help="Minimum yellow contour area in pixels (default: 400)",
+        help="Minimum block contour area in pixels (default: 400)",
     )
     parser.add_argument(
         "--confirm-frames", type=int, default=3,
@@ -155,6 +163,7 @@ def calibrate(
     path: Path,
     dictionary_name: str,
     marker_size_mm: float | None = None,
+    coords_csv: Path = COORDS_CSV,
 ) -> None:
     missing = sorted(set(MARKER_ROBOT_COORDS_MM) - set(corners_by_id))
     if missing:
@@ -222,6 +231,11 @@ def calibrate(
             "fitted_xy_mm": fit.centers_mm[index].tolist(),
         })
 
+    drop_sets = []
+    if path.is_file():
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if previous.get("version") == 3:
+            drop_sets = archive_pairs(previous, coords_csv)
     calibration = {
         "version": 3,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -235,6 +249,7 @@ def calibrate(
         "marker_size_mm": fit.marker_size_mm,
         "touch_rms_mm": touch_rms_mm,
         "corner_rms_mm": fit.corner_rms_mm,
+        "drop_sets": drop_sets,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(calibration, indent=2) + "\n", encoding="utf-8")
@@ -251,6 +266,10 @@ def calibrate(
     if fit.corner_rms_mm > 2:
         print("WARNING: the markers don't look like flat, equal squares. Make sure "
               "they lie flat and are all printed at the same size.")
+    if drop_sets:
+        kept = len(carried_pairs(calibration)[0])
+        stored = sum(len(s["pairs"]) for s in drop_sets)
+        print(f"Drop-calibrate pairs: {kept} of {stored} carried into this calibration.")
     print("Keep the camera fixed and use this same camera resolution for tracking.")
 
 
@@ -406,6 +425,7 @@ def refine_calibration(path: Path, coords_csv: Path = COORDS_CSV) -> None:
         raise ValueError("The correction doesn't help on held-out points; "
                          "calibration left unchanged. Record more pairs.")
 
+    data["drop_sets"] = archive_pairs(data, coords_csv)
     homography = correction @ np.asarray(data["pixel_to_robot_xy"])
     homography /= homography[2, 2]
     data.setdefault("pixel_to_robot_xy_markers", data["pixel_to_robot_xy"])
@@ -459,6 +479,13 @@ class BlockTracker:
     """Suppress flickering noise by only reporting blocks seen in several
     consecutive frames near the same image position.
 
+    A block is only followed by a track of its own color. With ``yaw_of``, a
+    function giving a block's angle, each reported block also gets a stack
+    ``level`` voted over those frames, since a single frame can misjudge one, and
+    ``steady_yaw``, the average over the same frames without outliers (None
+    without any), and ``yaw_ready``: that angle has held still long enough to
+    pick by.
+
     Each reported block gets ``steady_contact_xy``: the median ``contact_xy``
     over the last ``confirm_frames`` frames, using only frames where the top
     face was found, since the no-top-face fallback can be off by about half
@@ -466,9 +493,10 @@ class BlockTracker:
     the top face.
     """
 
-    def __init__(self, confirm_frames: int, max_jump_px: float = 25.0):
+    def __init__(self, confirm_frames: int, max_jump_px: float = 25.0, yaw_of=None):
         self.confirm_frames = confirm_frames
         self.max_jump_px = max_jump_px
+        self.yaw_of = yaw_of
         self.tracks: list[dict] = []
 
     def update(self, blocks: list[dict]) -> list[dict]:
@@ -478,20 +506,35 @@ class BlockTracker:
             center = np.asarray(block["center_xy"])
             hits = 1
             history: deque = deque(maxlen=self.confirm_frames)
-            if unmatched:
-                distances = [np.linalg.norm(t["center"] - center) for t in unmatched]
-                nearest = int(np.argmin(distances))
-                if distances[nearest] <= self.max_jump_px:
-                    track = unmatched.pop(nearest)
-                    hits, history = track["hits"] + 1, track["history"]
+            yaws: deque = deque(maxlen=self.confirm_frames)
+            levels: deque = deque(maxlen=self.confirm_frames)
+            same_color = [t for t in unmatched if t["block"]["color"] == block["color"]]
+            if same_color:
+                track = min(same_color, key=lambda t: np.linalg.norm(t["center"] - center))
+                if np.linalg.norm(track["center"] - center) <= self.max_jump_px:
+                    unmatched = [t for t in unmatched if t is not track]
+                    hits, history, yaws = track["hits"] + 1, track["history"], track["yaws"]
+                    levels = track["levels"]
             history.append(block["contact_xy"] if block["top_found"] else None)
+            if "level" in block:
+                levels.append(block["level"])
+                block["level"] = int(np.median(levels))
+                block["height_mm"] = block["level"] * CUBE_SIDE_MM
+            if self.yaw_of is not None and block["top_found"]:
+                yaws.append((self.yaw_of(block), block.get("confidence", 1.0)))
+            block["steady_yaw"], block["yaw_ready"] = None, False
+            if yaws:
+                yaw, spread, agreeing = robust_yaw(*zip(*yaws))
+                block["steady_yaw"] = yaw
+                block["yaw_ready"] = (spread <= YAW_STABLE_DEG
+                                      and agreeing >= YAW_MIN_AGREEMENT * self.confirm_frames)
             top_samples = [xy for xy in history if xy is not None]
             block["steady_contact_xy"] = (
                 tuple(float(v) for v in np.median(top_samples, axis=0))
                 if 2 * len(top_samples) >= self.confirm_frames else None
             )
             tracks.append({"center": center, "hits": hits, "history": history,
-                           "block": block})
+                           "yaws": yaws, "levels": levels, "block": block})
         self.tracks = tracks
         return [t["block"] for t in tracks if t["hits"] >= self.confirm_frames]
 
@@ -613,10 +656,15 @@ def main() -> None:
             f"average table Z={calibration['table_z_mm']:.1f} mm. "
             "Press P to print coordinates, Q to quit."
         )
-        border = cv2.convexHull(np.asarray(
+        extension = border_extension(calibration)
+        border = work_border(cv2.convexHull(np.asarray(
             [m["image_xy"] for m in calibration["markers"]], dtype=np.float32
-        ))
-        tracker = BlockTracker(args.confirm_frames)
+        )), extension)
+        cube_camera = CubeCamera(homography, frame_size)
+        tracker = BlockTracker(
+            args.confirm_frames,
+            yaw_of=lambda block: block_yaw(block, lambda pts: project(homography, pts)),
+        )
         frame = first_frame
         last_report = 0.0
         last_signature = None
@@ -624,7 +672,7 @@ def main() -> None:
         while True:
             detections = detect_markers(frame, detector)
             shift_warned = check_camera_shift(detections, calibration, shift_warned)
-            border = aruco_border(detections, border)
+            border = work_border(aruco_border(detections, border), extension)
             view = frame.copy()
             marker_overlay(view, detections)
             cv2.polylines(view, [np.rint(border).astype(np.int32)], True, (255, 160, 0), 2)
@@ -634,6 +682,8 @@ def main() -> None:
                 border=border,
                 border_margin=args.border_margin,
                 min_fill=args.min_fill,
+                colors=BLOCK_COLORS,
+                camera=cube_camera,
             )
             image_blocks = tracker.update(image_blocks)
             blocks = []
@@ -653,12 +703,14 @@ def main() -> None:
                     px, py = image_block["contact_xy"]
                     cv2.circle(view, (round(px), round(py)), 5, (0, 140, 255), -1)
                 mode = "top" if image_block["top_found"] else "no top face"
-                text = f"{image_block['label']} ({mode}) X{x:.1f} Y{y:.1f} mm"
+                yaw = image_block["steady_yaw"]
+                angle = "" if yaw is None else f" {yaw:.0f} deg"
+                text = f"{image_block['label']} ({mode}) X{x:.1f} Y{y:.1f} mm{angle}"
                 cv2.putText(view, text, (left, max(20, top - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
             cv2.putText(
                 view,
-                f"Yellow detections: {len(blocks)}",
+                f"Blocks: {len(blocks)}",
                 (18, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2,
             )
             cv2.imshow("Camera: ArUco + colored blocks", view)

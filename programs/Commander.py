@@ -20,7 +20,7 @@ from parol6 import RobotClient
 from parol6.utils.errors import MotionError
 
 HOST, PORT = "127.0.0.1", 5001
-TOOL = "PNEUMATIC"
+TOOL = "ljllpjplllljlwjh"
 
 HOME_ANGLES = [90.0, -90.0, 180.0, 0.0, 0.0, 180.0]
 HOME_TOLERANCE_DEG = 2.0
