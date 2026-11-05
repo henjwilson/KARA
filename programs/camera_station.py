@@ -13,16 +13,17 @@ does nothing. Hold one movement key at a time.
     Robot      H home   G calibrated home   V open   B close   Space STOP
     Jogging    [ ] speed   - = acceleration   F WRF/TRF   R Rx free
     Save       P print pose   C save pose   Y save yellow blocks to the CSV
-    Vision     X start/stop seek (red)   T T calibrate table
+    Vision     X start/stop seek (yellow, red)   T T calibrate table
                M M drop calibrate (block in the gripper first)
     Camera     1 auto exposure on/off   2 autofocus on/off
                Z show/hide the green outline
     Quit       Esc
 
-Seek homes the arm, then picks each red block and drops it beside the base
-(SEEK_COLOR and DROP_POSE in OpenCV/seek_yellow.py), until X or Space. Space
-stops the arm where it is at once, and nothing moves afterwards until you press a key; after stopping a move the arm takes about
-10 s to accept new commands. Jogging is off while seeking.
+Seek homes the arm, then picks each yellow and red block, dropping yellow ones
+at home and red ones beside the base, where the arm waits for the next block
+(SEEK_DROPS in OpenCV/seek_yellow.py), until X or Space. Space stops the arm
+where it is at once, and nothing moves afterwards until you press a key; after
+stopping a move the arm takes about 10 s to accept new commands. Jogging is off while seeking.
 
 T and M need pressing twice so that a stray key can't start them. After the
 camera moves, T is all it needs: drop-calibrate pairs carry over through the
@@ -30,8 +31,8 @@ four markers. That relies on the markers staying put on the table; if they
 moved, the pairs are skipped with a warning until they are back.
 
 All four block colors are shown with their angle on the table, and a stack
-with its level. Only red blocks are picked, and only yellow ones saved, which is
-what drop calibrate uses; picks happen only once their
+with its level. Only yellow and red blocks are picked, and only yellow ones
+saved, which is what drop calibrate uses; picks happen only once their
 angle has held steady. A block is a 3D cube fitted to its outline
 (OpenCV/cube_pose.py), so a tilted view or a lit side doesn't shift it.
 
@@ -120,10 +121,9 @@ from placement import (  # noqa: E402
 from seek_yellow import (  # noqa: E402
     FORGET_AFTER_FRAMES,
     GRIP_SETTLE_S,
-    DROP_POSE,
     MOVE_SPEED,
     SAFE_HEIGHT_MM,
-    SEEK_COLOR,
+    SEEK_DROPS,
     SLOW_SPEED,
     VISITED_RADIUS_MM,
 )
@@ -424,13 +424,13 @@ class RobotWorker(threading.Thread):
     def seek_start(self) -> None:
         self.home()
         self.gripper(close=False)
-        print(f"Looking for {SEEK_COLOR} blocks.")
+        print(f"Looking for {' and '.join(SEEK_DROPS)} blocks.")
 
-    def pick_and_drop(self, x: float, y: float, z: float, plan: Plan) -> None:
+    def pick_and_drop(self, x: float, y: float, z: float, plan: Plan, color: str) -> None:
         """seek_yellow's cycle, except that Stop ends it without any recovery
         move, which would otherwise carry on driving the arm."""
         rbt = self.rbt
-        print(f"Picking {SEEK_COLOR} at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
+        print(f"Picking {color} at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
         above = None
         try:
             self.run_motion(lambda: rbt.move_j(plan.angles, speed=MOVE_SPEED))
@@ -442,10 +442,14 @@ class RobotWorker(threading.Thread):
                 self.check_abort()
             self.gripper(close=True)
             self.run_motion(lambda: rbt.move_l(above, speed=SLOW_SPEED))
-            self.run_motion(lambda: rbt.move_j(pose=DROP_POSE, speed=MOVE_SPEED))
-            self.gripper(close=False)
-            self.home()
-            print(f"Dropped. Looking for another {SEEK_COLOR} block...")
+            drop = SEEK_DROPS[color]
+            if drop is None:
+                self.home()
+                self.gripper(close=False)
+            else:
+                self.run_motion(lambda: rbt.move_j(pose=drop, speed=MOVE_SPEED))
+                self.gripper(close=False)
+            print("Dropped. Looking for another block...")
         except ROBOT_ERRORS as exc:
             self.check_abort()
             print(f"Pick failed ({exc}); returning home.")
@@ -581,7 +585,7 @@ class Station:
         return [b for b in self.blocks if b["color"] == "yellow"]
 
     def track_blocks(self, detected: list[dict], view: np.ndarray,
-                     busy: bool) -> tuple[float, float, float, float] | None:
+                     busy: bool) -> tuple[float, float, float, float, str] | None:
         # The arm passes through the view while moving; restart confirmation
         # once it stops so its motion can't trigger a visit.
         if busy:
@@ -589,7 +593,7 @@ class Station:
         raw = [b for b in detected if self.inside_border(b)]
         self.blocks = self.tracker.update(raw)
         if not busy:
-            seen = [self.to_robot(b["contact_xy"]) for b in raw if b["color"] == SEEK_COLOR]
+            seen = [self.to_robot(b["contact_xy"]) for b in raw if b["color"] in SEEK_DROPS]
             for spot in list(self.visited):
                 if any(math.dist(spot, s) <= VISITED_RADIUS_MM for s in seen):
                     self.visited[spot] = 0
@@ -597,13 +601,13 @@ class Station:
                     del self.visited[spot]
                 else:
                     self.visited[spot] += 1
-        target = None
+        target, leftmost = None, float("inf")
         tops = []
         for block in self.blocks:
             steady = block["steady_contact_xy"]
             height = block.get("height_mm", 0.0)
             x, y = self.to_robot(steady or block["contact_xy"], height)
-            sought = block["color"] == SEEK_COLOR
+            sought = block["color"] in SEEK_DROPS
             done = sought and any(math.dist((x, y), p) <= VISITED_RADIUS_MM
                                   for p in [*self.visited, *self.unreachable])
             if block["top_found"]:
@@ -627,8 +631,10 @@ class Station:
                              "color": block["color"]})
             cv2.putText(view, f"{text} X{x:.0f} Y{y:.0f}", (left, max(20, top - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
-            if sought and steady and block["yaw_ready"] and not done and target is None:
-                target = (x, y, yaw, height)
+            # Leftmost in the camera first, so seek sweeps the table left to right.
+            if (sought and steady and block["yaw_ready"] and not done
+                    and block["center_xy"][0] < leftmost):
+                target, leftmost = (x, y, yaw, height, block["color"]), block["center_xy"][0]
         self.workspace.update(tops)
         return target
 
@@ -647,8 +653,8 @@ class Station:
             cv2.putText(view, f"ignored: {reason}", (left, max(20, top - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-    def go_pick(self, target: tuple[float, float, float, float]) -> None:
-        x, y, yaw, height = target
+    def go_pick(self, target: tuple[float, float, float, float, str]) -> None:
+        x, y, yaw, height, color = target
         z = self.correction.pick_z(x, y, height)
         worker = self.worker
 
@@ -660,7 +666,7 @@ class Station:
                       f"{yaw:.0f} deg from here; skipping.")
                 self.unreachable.append((x, y))
             else:
-                worker.pick_and_drop(planned[0], planned[1], z, planned[2])
+                worker.pick_and_drop(planned[0], planned[1], z, planned[2], color)
 
         if worker.submit(job):
             self.visited[(x, y)] = 0
@@ -783,7 +789,7 @@ class Station:
         elif now < self.confirm_until:
             status = self.confirm_prompt
         elif self.worker.seeking:
-            status = f"SEEK {SEEK_COLOR.upper()} {'moving' if busy else 'searching'}"
+            status = f"SEEK {'moving' if busy else 'searching'}"
         else:
             status = "ARM BUSY" if busy else "JOG"
         jogger = self.worker.jogger

@@ -1,4 +1,4 @@
-"""Watch the table for red blocks; pick each one up and drop it beside the arm.
+"""Watch the table for yellow and red blocks; pick each up and drop it off.
 
 Setup:
     Run `parol6-server` in a separate terminal FIRST, then run this script
@@ -8,13 +8,14 @@ Setup:
 
         .venv/bin/python OpenCV/seek_yellow.py --camera 0
 
-Each cycle: wait for a confirmed SEEK_COLOR block inside the ArUco border, turn
-its camera position into robot XY with the drop-calibrate correction, and
+Each cycle: wait for a confirmed block of a SEEK_DROPS color inside the ArUco
+border, turn its camera position into robot XY with the drop-calibrate
+correction, and
 plan a gripper orientation that lines the jaws up with the block's sides. The
 arm moves SAFE_HEIGHT_MM above the block, descends straight down to the TCP
-height the drop-calibrate releases had there, grips, lifts, moves to
-DROP_POSE, opens the gripper to drop the block, and homes. Press Q in the
-camera window to stop.
+height the drop-calibrate releases had there, grips, and lifts. Yellow blocks
+are dropped at home; red ones at RED_DROP_POSE, where the arm stays and goes
+on to the next block. Press Q in the camera window to stop.
 """
 
 from __future__ import annotations
@@ -71,9 +72,10 @@ MOVE_SPEED = 0.3
 SLOW_SPEED = 0.1
 # Let the arm stop swaying before the jaws close on the block.
 GRIP_SETTLE_S = 1.5
-SEEK_COLOR = "red"
-# Where picked blocks are let go, WRF mm and deg: beside the base, opposite home.
-DROP_POSE = [8.32, -196.84, 279.01, -88.92, -20.68, -88.31]
+# Red blocks are let go here, WRF mm and deg: beside the base, opposite home.
+RED_DROP_POSE = [8.32, -196.84, 279.01, -88.92, -20.68, -88.31]
+# Colors sought, each with where it's dropped: None is home.
+SEEK_DROPS = {"yellow": None, "red": RED_DROP_POSE}
 # A block within this distance of one already visited is the same block.
 VISITED_RADIUS_MM = 25.0
 # A visited spot empty for this many frames is forgotten, so a new block
@@ -102,9 +104,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def pick_and_drop(rbt: RobotClient | None, x: float, y: float, z: float,
-                  plan: Plan) -> None:
-    """Pick the block at (x, y) with the TCP at height z, then drop it at home."""
-    print(f"Picking {SEEK_COLOR} at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
+                  plan: Plan, color: str) -> None:
+    """Pick the block at (x, y) with the TCP at height z, then drop it where
+    its color goes."""
+    print(f"Picking {color} at X={x:.1f} Y={y:.1f} Z={z:.1f} mm  {plan.describe()}")
     if rbt is None:
         time.sleep(1.0)
         return
@@ -118,10 +121,14 @@ def pick_and_drop(rbt: RobotClient | None, x: float, y: float, z: float,
         time.sleep(GRIP_SETTLE_S)
         set_gripper(rbt, close=True)
         rbt.move_l(above, speed=SLOW_SPEED, wait=True, timeout=30.0)
-        rbt.move_j(pose=DROP_POSE, speed=MOVE_SPEED, wait=True, timeout=30.0)
-        set_gripper(rbt, close=False)
-        rbt.home(wait=True)
-        print(f"Dropped. Looking for another {SEEK_COLOR} block...")
+        drop = SEEK_DROPS[color]
+        if drop is None:
+            rbt.home(wait=True)
+            set_gripper(rbt, close=False)
+        else:
+            rbt.move_j(pose=drop, speed=MOVE_SPEED, wait=True, timeout=30.0)
+            set_gripper(rbt, close=False)
+        print("Dropped. Looking for another block...")
     except (MotionError, TimeoutError, GripperError) as exc:
         print(f"Pick failed ({exc}); returning home.")
         try:
@@ -190,7 +197,7 @@ def main() -> None:
     unreachable: list[tuple[float, float]] = []
     robot_job: threading.Thread | None = None
     shift_warned = False
-    print(f"Looking for {SEEK_COLOR} blocks. Press Q in the camera window to quit.")
+    print(f"Looking for {' and '.join(SEEK_DROPS)} blocks. Press Q in the camera window to quit.")
 
     try:
         while True:
@@ -205,7 +212,7 @@ def main() -> None:
             raw = [] if busy else detect_colored_blocks(
                 frame, min_area=args.min_area, border=border,
                 border_margin=args.border_margin, min_fill=args.min_fill,
-                camera=cube_camera, colors=(SEEK_COLOR,),
+                camera=cube_camera, colors=tuple(SEEK_DROPS),
             )
             blocks = tracker.update(raw)
             if not busy:
@@ -221,7 +228,7 @@ def main() -> None:
             view = frame.copy()
             marker_overlay(view, detections)
             cv2.polylines(view, [np.rint(border).astype(np.int32)], True, (255, 160, 0), 2)
-            target = None
+            target, leftmost = None, float("inf")
             for block in blocks:
                 steady = block["steady_contact_xy"]
                 height = block["height_mm"]
@@ -243,15 +250,18 @@ def main() -> None:
                 mode = "top" if steady else "no top face, waiting"
                 cv2.putText(view, f"({mode}) X{x:.0f} Y{y:.0f}", (left, max(20, top - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-                if steady and block["yaw_ready"] and not done and target is None:
-                    target = (x, y, block["steady_yaw"], height)
+                # Leftmost in the camera first, so seek sweeps the table left to right.
+                if (steady and block["yaw_ready"] and not done
+                        and block["center_xy"][0] < leftmost):
+                    target = (x, y, block["steady_yaw"], height, block["color"])
+                    leftmost = block["center_xy"][0]
             status = "ROBOT MOVING" if busy else "SEARCHING"
             cv2.putText(view, f"{status} | visited {len(visited)}", (18, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.imshow(f"Seek {SEEK_COLOR}", view)
+            cv2.imshow("Seek", view)
 
             if target is not None:
-                x, y, yaw, height = target
+                x, y, yaw, height, color = target
                 z = correction.pick_z(x, y, height)
                 planned = plan_seek_pick(correction, x, y, z, SAFE_HEIGHT_MM, yaw)
                 if planned is None:
@@ -261,7 +271,8 @@ def main() -> None:
                 else:
                     visited[(x, y)] = 0
                     robot_job = threading.Thread(
-                        target=pick_and_drop, args=(rbt, planned[0], planned[1], z, planned[2]),
+                        target=pick_and_drop,
+                        args=(rbt, planned[0], planned[1], z, planned[2], color),
                         daemon=True,
                     )
                     robot_job.start()
