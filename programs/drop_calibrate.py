@@ -297,7 +297,6 @@ class Vision:
             raise SystemExit(f"Could not open camera {camera_index}.")
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
         frame = self.first_frame()
         apply_camera_settings(exposure, focus)
         self.calibration = load_calibration(
