@@ -659,6 +659,7 @@ class KaraProgramsGUI(QMainWindow):
         if moves_robot:
             if not self.allow_motion.isChecked():
                 raise RuntimeError('Robot motion is locked. Tick Enable real robot motion first.')
+            # motion lock still checked above, only the popup is skipped
             if confirmed:
                 return True
             warning = f'\n\nCAUTION: {caution}' if caution else ''
@@ -702,6 +703,7 @@ class KaraProgramsGUI(QMainWindow):
         except (OSError, RuntimeError, ValueError) as exc:
             self.camera_panel.set_reserved(False)
             self._resume_preview_if_needed()
+            # voice gets the error back instead of a popup
             if voice:
                 self.log(str(exc), 'error')
                 raise
@@ -727,6 +729,7 @@ class KaraProgramsGUI(QMainWindow):
             self.program_process = self._spawn(action_command(action, self._python()), name='program')
             self.script_state_label.setText(f'●  RUNNING · {names[action]}')
         except (OSError, RuntimeError, ValueError) as exc:
+            # voice gets the error back instead of a popup
             if voice:
                 self.log(str(exc), 'error')
                 raise

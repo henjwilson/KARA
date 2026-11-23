@@ -35,6 +35,8 @@ class KaraAssistant:
                  clock: Callable[[], float] = time.monotonic,
                  motion_hint: str = "Restart with --enable-motion",
                  require_wake: bool = True):
+        # motion_hint is what she says when motion is off, the gui and old script fix it differently
+        # require_wake=False is for the gui, no "hey kara" needed
         self.runner = runner
         self.enable_motion = enable_motion
         self.wake_seconds = wake_seconds
@@ -50,6 +52,7 @@ class KaraAssistant:
         if self.pending and now > self.pending.until:
             self.pending = None
         has_wake, phrase = strip_wake(utterance)
+        # no wake word means every phrase counts as awake
         if not self.require_wake:
             has_wake = True
         if has_wake and not phrase:
@@ -72,6 +75,7 @@ class KaraAssistant:
                 self.pending = None
                 self.wake_until = 0.0
                 return self._launch(pending.kind, pending.key)
+            # tell them the exact words to say
             return f"That did not match. Say confirm {say_name(pending.key)}."
 
         if not has_wake and now > self.wake_until:
@@ -85,10 +89,13 @@ class KaraAssistant:
             self.pending = None
             return "Okay, canceled."
         if intent.kind == "help":
+            # one short list, the old one had semicolons the voice just ran together
             wake = "Hey Kara, " if self.require_wake else ""
             return (f"You can say {wake}seek yellow, track yellow, home, park, open gripper, "
                     "close gripper, status, or stop. Anything that moves the robot needs a confirm.")
         if intent.kind == "status":
+            # full sentences, the voice reads flat with no real pauses so wording matters
+            # old reply was "running: nothing. motion disabled." and sounded like one word
             running = (f"{say_name(self.runner.active_name)} is running." if self.runner.running()
                        else "Nothing is running.")
             mode = "Motion is enabled." if self.enable_motion else "Motion is currently disabled."
@@ -131,5 +138,6 @@ class KaraAssistant:
         return f"Starting {say_name(key)}." if okay else "Another program is running."
 
     def _ask_confirm(self, key: str) -> str:
+        # kept short, the long version used up half the 8 second confirm window
         name = say_name(key)
         return f"Please say confirm {name}."
